@@ -1,0 +1,282 @@
+#include "boom_native_decoder.h"
+#include "native_fields.h"
+#include <array>
+#include <string>
+#include <utility>
+
+namespace difftest_s::native {
+namespace {
+using Sample = NativeHartSample;
+namespace boom = rvwmo::boom;
+
+struct IdentityFields {
+  NativeField epoch, uid, rob, memory, attempt;
+  IdentityFields(const NativeFields &fields, const std::string &path)
+      : epoch(fields.field(path + ".epoch")), uid(fields.field(path + ".uid")),
+        rob(fields.field(path + ".rob_generation")), memory(fields.field(path + ".memory_generation")),
+        attempt(fields.field(path + ".attempt")) {}
+  boom::ProbeIdentity read(const Sample &sample) const {
+    return {epoch.read(sample), uid.read(sample), rob.read(sample), memory.read(sample),
+            static_cast<uint32_t>(attempt.read(sample))};
+  }
+};
+
+struct RecordFields {
+  NativeField valid, cycle;
+  IdentityFields identity;
+  RecordFields(const NativeFields &fields, const std::string &path)
+      : valid(fields.field(path + ".valid")), cycle(fields.field(path + ".bits.source_cycle")),
+        identity(fields, path + ".bits.identity") {}
+  void require_current(const Sample &sample, uint64_t source_cycle) const {
+    if (cycle.read(sample) != source_cycle)
+      throw std::invalid_argument("BOOM native handshake cycle differs from the captured source edge");
+  }
+};
+
+struct InstructionFields : RecordFields {
+  NativeField pc, instruction, rob, ldq, stq, uses_ldq, uses_stq, atomic, architectural;
+  NativeField size, destination_type, destination, writeback;
+  InstructionFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), pc(fields.field(path + ".bits.pc")),
+        instruction(fields.field(path + ".bits.instruction")), rob(fields.field(path + ".bits.rob_index")),
+        ldq(fields.field(path + ".bits.ldq_index")), stq(fields.field(path + ".bits.stq_index")),
+        uses_ldq(fields.field(path + ".bits.uses_ldq")), uses_stq(fields.field(path + ".bits.uses_stq")),
+        atomic(fields.field(path + ".bits.atomic")), architectural(fields.field(path + ".bits.architectural")),
+        size(fields.field(path + ".bits.mem_size")), destination_type(fields.field(path + ".bits.destination_type")),
+        destination(fields.field(path + ".bits.destination")), writeback(fields.field(path + ".bits.write_data")) {}
+  boom::ProbeInstruction read(const Sample &sample) const {
+    boom::ProbeInstruction result;
+    result.identity = identity.read(sample);
+    result.pc = pc.read(sample);
+    result.instruction = instruction.read(sample);
+    result.rob_index = rob.read(sample);
+    result.ldq_index = ldq.read(sample);
+    result.stq_index = stq.read(sample);
+    result.uses_ldq = uses_ldq.read(sample);
+    result.uses_stq = uses_stq.read(sample);
+    result.atomic = atomic.read(sample);
+    result.architectural = architectural.read(sample);
+    result.log2_size = size.read(sample);
+    result.destination_type = static_cast<boom::IntegerDestinationType>(destination_type.read(sample));
+    result.logical_destination = destination.read(sample);
+    result.writeback_value = writeback.read(sample);
+    return result;
+  }
+};
+
+struct QueueFields : RecordFields {
+  NativeField index, load;
+  QueueFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), index(fields.field(path + ".bits.index")),
+        load(fields.field(path + ".bits.load")) {}
+  boom::ProbeQueueAllocation read(const Sample &sample) const {
+    return {identity.read(sample), static_cast<uint32_t>(index.read(sample)), static_cast<bool>(load.read(sample))};
+  }
+};
+
+struct AttemptFields : RecordFields {
+  NativeField index, address;
+  AttemptFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), index(fields.field(path + ".bits.queue_index")),
+        address(fields.field(path + ".bits.address")) {}
+  boom::NativeAttempt read(const Sample &sample) const {
+    return {identity.read(sample), static_cast<uint32_t>(index.read(sample))};
+  }
+};
+
+struct LoadFields : RecordFields {
+  NativeField index, address, word, size, mask, writer_mask, source_valid, source_kind;
+  std::vector<IdentityFields> writers;
+  LoadFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), index(fields.field(path + ".bits.queue_index")),
+        address(fields.field(path + ".bits.address")), word(fields.field(path + ".bits.raw_word")),
+        size(fields.field(path + ".bits.mem_size")), mask(fields.field(path + ".bits.byte_mask")),
+        writer_mask(fields.field(path + ".bits.writer_mask")), source_valid(fields.field(path + ".bits.source_valid")),
+        source_kind(fields.field(path + ".bits.source_kind")) {
+    for (unsigned byte = 0; byte < 8; ++byte)
+      writers.emplace_back(fields, path + ".bits.writers[" + std::to_string(byte) + ']');
+  }
+  boom::NativeLoad read(const Sample &sample) const {
+    boom::NativeLoad result;
+    auto &probe = result.probe;
+    probe.identity = identity.read(sample);
+    probe.queue_index = index.read(sample);
+    probe.address = address.read(sample);
+    probe.raw_word = word.read(sample);
+    probe.log2_size = size.read(sample);
+    probe.byte_mask = mask.read(sample);
+    probe.known_writer_mask = writer_mask.read(sample);
+    for (unsigned byte = 0; byte < writers.size(); ++byte)
+      probe.writers[byte] = writers[byte].read(sample);
+    // Private RTL source values are defined in boom.v4.difftest.MemoryProbe.
+    const auto kind = source_kind.read(sample);
+    switch (kind) {
+    case 1: probe.sampling_point = boom::LoadSamplingPoint::CacheDataArray; break;
+    case 2: case 3: probe.sampling_point = boom::LoadSamplingPoint::StoreForwarding; break;
+    case 4: probe.sampling_point = boom::LoadSamplingPoint::RefillData; break;
+    default: probe.sampling_point = boom::LoadSamplingPoint::Unavailable; break;
+    }
+    probe.source_complete = source_valid.read(sample) &&
+                            probe.sampling_point != boom::LoadSamplingPoint::Unavailable;
+    result.sampled_at.cycle = cycle.read(sample);
+    // Under the selected shared physical clock, pipeline/STQ/line-buffer
+    // forwarding selects existing register values before the active array-write
+    // edge. These are phase 0; the SRAM request alone does not prove whether
+    // its selected row was sampled before or after a concurrent write.
+    result.sampled_at.order_qualified = kind == 2 || kind == 3 || kind == 4;
+    return result;
+  }
+};
+
+struct StoreFields : RecordFields {
+  NativeField index, address, word, size, mask, atomic;
+  StoreFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), index(fields.field(path + ".bits.queue_index")),
+        address(fields.field(path + ".bits.address")), word(fields.field(path + ".bits.word")),
+        size(fields.field(path + ".bits.mem_size")), mask(fields.field(path + ".bits.byte_mask")),
+        atomic(fields.field(path + ".bits.atomic")) {}
+  boom::ProbeStore read(const Sample &sample) const {
+    return {identity.read(sample), static_cast<uint32_t>(index.read(sample)), address.read(sample), word.read(sample),
+            static_cast<uint8_t>(size.read(sample)), static_cast<uint8_t>(mask.read(sample)),
+            static_cast<bool>(atomic.read(sample))};
+  }
+};
+
+struct SquashFields : RecordFields {
+  NativeField rob;
+  SquashFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), rob(fields.field(path + ".bits.rob_index")) {}
+  boom::NativeSquash read(const Sample &sample) const {
+    return {identity.read(sample), static_cast<uint32_t>(rob.read(sample))};
+  }
+};
+
+template <class Fields>
+std::vector<Fields> vector_fields(const NativeFields &fields, std::string_view group) {
+  std::vector<Fields> result;
+  for (const auto &path : fields.records(group))
+    result.emplace_back(fields, path);
+  return result;
+}
+
+template <class Fields, class Record>
+void capture_current(const Sample &sample, uint64_t cycle, const std::vector<Fields> &fields,
+                     std::vector<Record> &records) {
+  for (const auto &field : fields) {
+    if (!field.valid.read(sample))
+      continue;
+    field.require_current(sample, cycle);
+    records.push_back(field.read(sample));
+  }
+}
+} // namespace
+
+struct BoomNativeDecoder::Fields {
+  const NativeProbeLayout *layout;
+  BoomPublicationSource publication_source;
+  NativeFields metadata;
+  NativeField hart, queues_empty, cache_idle;
+  RecordFields trap;
+  std::vector<InstructionFields> allocate, retire;
+  std::vector<QueueFields> queues;
+  std::vector<AttemptFields> begin, cancel, nack, retired_load;
+  std::vector<LoadFields> complete;
+  std::vector<StoreFields> local_store;
+  std::vector<SquashFields> squash;
+  std::vector<NativeField> retire_data;
+  AttemptFields release;
+  StoreFields publication;
+
+  Fields(const NativeProbeLayout &source, BoomPublicationSource publications)
+      : layout(&source), publication_source(std::move(publications)), metadata(source),
+        hart(metadata.field("core.hartid")), queues_empty(metadata.field("lsu.queues_empty")),
+        cache_idle(metadata.field("cache.idle")), trap(metadata, "core.trap"),
+        allocate(vector_fields<InstructionFields>(metadata, "core.allocate")),
+        retire(vector_fields<InstructionFields>(metadata, "core.retire")),
+        queues(vector_fields<QueueFields>(metadata, "lsu.allocate")),
+        begin(vector_fields<AttemptFields>(metadata, "lsu.begin")),
+        cancel(vector_fields<AttemptFields>(metadata, "lsu.cancel")),
+        nack(vector_fields<AttemptFields>(metadata, "lsu.nack")),
+        retired_load(vector_fields<AttemptFields>(metadata, "lsu.retire_load")),
+        complete(vector_fields<LoadFields>(metadata, "lsu.complete")),
+        local_store(vector_fields<StoreFields>(metadata, "lsu.local_store")),
+        squash(vector_fields<SquashFields>(metadata, "core.squash")),
+        release(metadata, "lsu.store_release"), publication(metadata, "cache.store_applied") {
+    if (source.kind != 2 || !publication_source)
+      throw std::invalid_argument("BOOM native decoder requires BOOM metadata and a fabric source allocator");
+    for (size_t lane = 0; lane < retired_load.size(); ++lane)
+      retire_data.push_back(metadata.field("lsu.retire_load_data[" + std::to_string(lane) + ']'));
+  }
+
+  void capture(const Sample &sample, boom::NativeFrame &frame) const {
+    if (hart.read(sample) != layout->hart)
+      throw std::invalid_argument("BOOM native probe hartid differs from its exported port");
+    capture_current(sample, frame.cycle, allocate, frame.allocations);
+    capture_current(sample, frame.cycle, queues, frame.queue_allocations);
+    capture_current(sample, frame.cycle, begin, frame.begins);
+    capture_current(sample, frame.cycle, cancel, frame.cancellations);
+    capture_current(sample, frame.cycle, nack, frame.cancellations);
+    capture_current(sample, frame.cycle, local_store, frame.local_stores);
+    capture_current(sample, frame.cycle, retire, frame.retirements);
+    capture_current(sample, frame.cycle, squash, frame.squashes);
+    for (const auto &field : complete)
+      if (field.valid.read(sample))
+        frame.completions.push_back(field.read(sample));
+    for (size_t lane = 0; lane < retired_load.size(); ++lane) {
+      const auto &field = retired_load[lane];
+      if (!field.valid.read(sample))
+        continue;
+      field.require_current(sample, frame.cycle);
+      frame.retired_loads.push_back({field.identity.read(sample), static_cast<uint32_t>(field.index.read(sample)),
+                                    field.address.read(sample), retire_data[lane].read(sample)});
+    }
+    if (release.valid.read(sample)) {
+      release.require_current(sample, frame.cycle);
+      frame.store_releases.push_back(release.read(sample));
+    }
+    if (publication.valid.read(sample)) {
+      publication.require_current(sample, frame.cycle);
+      // Each observed scalar data-array write carries one native STQ writer,
+      // including per-request MSHR replay. This is not an ACK or a slot release.
+      auto source = publication_source(frame.cycle);
+      if (source.position.cycle != frame.cycle)
+        throw std::invalid_argument("BOOM fabric source allocator changed the hardware publication cycle");
+      // dataWriteArb.fire writes the exclusive data array at this active edge.
+      // Different L1s share phase 1, so this does not order their writes.
+      source.position.qualified_phase = 1;
+      source.position.order_qualified = true;
+      frame.publications.push_back({publication.read(sample), source,
+          source.position.producer_sequence, boom::StorePublicationEvidence::ExclusiveCacheDataWrite, true});
+    }
+    frame.trap = trap.valid.read(sample);
+    if (frame.trap)
+      trap.require_current(sample, frame.cycle);
+    frame.queues_empty = queues_empty.read(sample);
+    frame.cache_idle = cache_idle.read(sample);
+  }
+};
+
+BoomNativeDecoder::BoomNativeDecoder(const NativeProbeLayout &layout, BoomPublicationSource publication_source)
+    : fields_(std::make_unique<Fields>(layout, std::move(publication_source))) {}
+BoomNativeDecoder::~BoomNativeDecoder() = default;
+
+rvwmo::CheckResult BoomNativeDecoder::decode(const NativeFrame &source, boom::NativeFrame &output) const {
+  const auto hart = fields_->layout->hart;
+  if (source.reset)
+    return {rvwmo::CheckStatus::Pending, 0, "BOOM native source is in reset"};
+  if (source.samples.size() != fields_->layout->harts || hart >= source.samples.size() ||
+      source.samples[hart].layout != fields_->layout)
+    return {rvwmo::CheckStatus::Invalid, 0, "BOOM native snapshot does not match the configured layout or roster"};
+  try {
+    boom::NativeFrame frame;
+    frame.hart = hart;
+    frame.epoch = source.epoch;
+    frame.cycle = source.source_cycle;
+    fields_->capture(source.samples[hart], frame);
+    output = std::move(frame);
+    return {};
+  } catch (const std::invalid_argument &error) {
+    return {rvwmo::CheckStatus::Invalid, 0, error.what()};
+  }
+}
+} // namespace difftest_s::native

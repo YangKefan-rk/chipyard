@@ -1,0 +1,220 @@
+#include "boom_native_source.h"
+#include "rvwmo/producer_ids.h"
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+
+namespace difftest_s::native {
+namespace {
+namespace boom = rvwmo::boom;
+using rvwmo::CheckResult;
+using rvwmo::CheckStatus;
+
+CheckResult invalid(const char *message) { return {CheckStatus::Invalid, 0, message}; }
+CheckResult incomplete(const char *message) { return {CheckStatus::Incomplete, 0, message}; }
+CheckResult pending(const char *message) { return {CheckStatus::Pending, 0, message}; }
+
+template <class Record, class Identity>
+void exclude_bootstrap(std::vector<Record> &records, uint64_t entry_uid, Identity identity) {
+  records.erase(std::remove_if(records.begin(), records.end(), [&](const Record &record) {
+    return identity(record).uid < entry_uid;
+  }), records.end());
+}
+
+void select_entry_scope(boom::NativeFrame &frame, uint64_t entry_uid) {
+  const auto identity = [](const auto &record) { return record.identity; };
+  exclude_bootstrap(frame.allocations, entry_uid, identity);
+  exclude_bootstrap(frame.queue_allocations, entry_uid, identity);
+  exclude_bootstrap(frame.begins, entry_uid, identity);
+  exclude_bootstrap(frame.cancellations, entry_uid, identity);
+  exclude_bootstrap(frame.local_stores, entry_uid, identity);
+  exclude_bootstrap(frame.retirements, entry_uid, identity);
+  exclude_bootstrap(frame.retired_loads, entry_uid, identity);
+  exclude_bootstrap(frame.store_releases, entry_uid, identity);
+  exclude_bootstrap(frame.squashes, entry_uid, identity);
+  const auto probe_identity = [](const auto &record) { return record.probe.identity; };
+  exclude_bootstrap(frame.completions, entry_uid, probe_identity);
+  exclude_bootstrap(frame.publications, entry_uid, probe_identity);
+}
+} // namespace
+
+BoomNativeSource::BoomNativeSource(BoomNativeSourceConfiguration configuration)
+    : configuration_(std::move(configuration)), collectors_(configuration_.entry_pcs.size()),
+      entry_uids_(collectors_.size()), watermarks_(collectors_.size()), bootstrap_(collectors_.size()) {
+  if (!configuration_.epoch || collectors_.empty() || collectors_.size() > 256 || !configuration_.staged_events)
+    throw std::invalid_argument("BOOM native source requires a bounded hart roster, epoch and staging limit");
+  for (uint32_t hart = 0; hart < collectors_.size(); ++hart) {
+    const auto *layout = find_native_layout(2, hart);
+    if (!layout || layout->harts != collectors_.size() || !configuration_.entry_pcs[hart])
+      throw std::invalid_argument("BOOM native entry scope differs from the generated hart roster");
+    decoders_.push_back(std::make_unique<BoomNativeDecoder>(*layout, [this, hart](uint64_t cycle) {
+      if (captured_publication_sequence_ == UINT64_MAX)
+        throw std::invalid_argument("BOOM native fabric source sequence exhausted");
+      return boom::EventSource{rvwmo::memory_fabric_producer_id(hart),
+                              {cycle, 0, ++captured_publication_sequence_, false}};
+    }));
+  }
+}
+
+CheckResult BoomNativeSource::remember_failure(CheckResult result) {
+  if (result.status != CheckStatus::Pass && result.status != CheckStatus::Pending)
+    failure_ = result;
+  return result;
+}
+
+CheckResult BoomNativeSource::capture(const NativeFrame &frame) {
+  if (!failure_)
+    return failure_;
+  if (frame.reset)
+    return captured_cycle_ ? remember_failure(incomplete("BOOM source reset requires a new checked scope"))
+                           : pending("BOOM source is in reset");
+  if (frame.epoch != configuration_.epoch || frame.samples.size() != collectors_.size() ||
+      (captured_cycle_ && (*captured_cycle_ == UINT64_MAX || frame.source_cycle != *captured_cycle_ + 1)))
+    return remember_failure(invalid("BOOM complete source frame changed epoch, roster or cycle"));
+  for (uint32_t hart = 0; hart < collectors_.size(); ++hart) {
+    boom::NativeFrame decoded;
+    auto result = decoders_[hart]->decode(frame, decoded);
+    if (!result || !(result = capture_hart(std::move(decoded))))
+      return remember_failure(result);
+  }
+  captured_cycle_ = frame.source_cycle;
+  return {};
+}
+
+CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame) {
+  const auto hart = frame.hart;
+  if (!entry_uids_[hart]) {
+    auto &outside = bootstrap_[hart];
+    outside.instructions += frame.retirements.size();
+    outside.loads += frame.completions.size();
+    outside.stores += frame.publications.size();
+    outside.traps += frame.trap;
+    // Bootstrap RAM writes require an explicit initialized-state contract. This
+    // source deliberately does not derive reference RAM from observed DUT data.
+    if (!frame.publications.empty())
+      return incomplete("BOOM bootstrap store publication is outside the initialized entry-state contract");
+    for (const auto &allocation : frame.allocations) {
+      if (allocation.pc != configuration_.entry_pcs[hart])
+        continue;
+      if (entry_uids_[hart])
+        return invalid("BOOM native frame allocates its selected entry more than once");
+      entry_uids_[hart] = allocation.identity.uid;
+      boom::NativeCollectorConfiguration config;
+      config.hart = hart;
+      config.epoch = configuration_.epoch;
+      config.initial_cycle = frame.cycle;
+      config.limits = configuration_.limits;
+      config.staged_events = configuration_.staged_events;
+      collectors_[hart] = std::make_unique<boom::NativeCollector>(config);
+    }
+    if (!entry_uids_[hart]) {
+      watermarks_[hart] = frame.cycle;
+      return {};
+    }
+  }
+  select_entry_scope(frame, entry_uids_[hart]);
+  const auto captured = collectors_[hart]->capture(frame);
+  if (!captured.accepted)
+    return captured.check.status == CheckStatus::Pending
+               ? incomplete("BOOM source collector could not accept its complete native frame") : captured.check;
+  boom::CollectedObservations ready;
+  auto result = collectors_[hart]->take_ready(ready);
+  if (result.status == CheckStatus::Pending)
+    return {};
+  if (!result)
+    return result;
+  for (const auto &watermark : ready.batch.watermarks) {
+    if (watermark.producer_id != rvwmo::hart_producer_id(hart))
+      return invalid("BOOM collector closed an unexpected source producer");
+    watermarks_[hart] = watermark.closed_through.cycle;
+  }
+  if (ready.batch.events.size() > configuration_.staged_events -
+          std::min(configuration_.staged_events, events_.size()))
+    return incomplete("BOOM combined source staging limit exceeded");
+  events_.insert(events_.end(), ready.batch.events.begin(), ready.batch.events.end());
+  for (const auto &snapshot : ready.retirements)
+    if (!snapshots_.emplace(snapshot.id, snapshot).second)
+      return invalid("BOOM source repeats an architectural retirement snapshot");
+  return {};
+}
+
+CheckResult BoomNativeSource::take_ready(boom::CollectedObservations &output) {
+  if (!failure_)
+    return failure_;
+  if (!captured_cycle_)
+    return pending("BOOM source has no complete active edge");
+  const auto through = *std::min_element(watermarks_.begin(), watermarks_.end());
+  if (closed_cycle_ && through <= *closed_cycle_)
+    return pending("BOOM delayed observations keep the combined source prefix open");
+  std::stable_sort(events_.begin(), events_.end(), [](const auto &lhs, const auto &rhs) {
+    return lhs.source.cycle < rhs.source.cycle;
+  });
+  boom::CollectedObservations ready;
+  std::vector<rvwmo::OperationId> retired;
+  uint64_t next_fabric_sequence = emitted_publication_sequence_;
+  for (const auto &event : events_) {
+    if (event.source.cycle > through)
+      continue;
+    auto converted = event;
+    if (event.kind == rvwmo::RuntimeEventKind::StorePublish) {
+      if (next_fabric_sequence == UINT64_MAX)
+        return remember_failure(invalid("BOOM public fabric source sequence exhausted"));
+      // One channel per native L1 preserves its single write port. Cross-L1
+      // simultaneous writes remain on distinct unqualified producers. Delivery
+      // numbering within each channel never creates a cross-L1 GMO phase.
+      converted.source.producer_sequence = ++next_fabric_sequence;
+      for (auto &member : std::get<rvwmo::StorePublishEvent>(converted.payload).members)
+        member.publish_position = converted.source;
+    }
+    if (event.kind == rvwmo::RuntimeEventKind::InstructionRetire) {
+      const auto &instruction = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction;
+      const rvwmo::OperationId id{instruction.hart, instruction.epoch, instruction.uid, 0};
+      const auto snapshot = snapshots_.find(id);
+      if (snapshot == snapshots_.end())
+        return remember_failure(invalid("BOOM retired instruction has no independent actual result snapshot"));
+      ready.retirements.push_back(snapshot->second);
+      retired.push_back(id);
+    }
+    ready.batch.events.push_back(std::move(converted));
+  }
+  for (uint32_t hart = 0; hart < collectors_.size(); ++hart)
+    ready.batch.watermarks.push_back({rvwmo::hart_producer_id(hart), rvwmo::SourcePosition::end_of_cycle(through)});
+  for (uint32_t hart = 0; hart < collectors_.size(); ++hart)
+    ready.batch.watermarks.push_back({rvwmo::memory_fabric_producer_id(hart), rvwmo::SourcePosition::end_of_cycle(through)});
+  events_.erase(std::remove_if(events_.begin(), events_.end(), [through](const auto &event) {
+    return event.source.cycle <= through;
+  }), events_.end());
+  for (const auto &id : retired)
+    snapshots_.erase(id);
+  emitted_publication_sequence_ = next_fabric_sequence;
+  closed_cycle_ = through;
+  output = std::move(ready);
+  return {};
+}
+
+CheckResult BoomNativeSource::audit_reference_store(const rvwmo::ReferenceStoreValue &store) {
+  if (!failure_)
+    return failure_;
+  if (store.id.hart >= collectors_.size() || !collectors_[store.id.hart])
+    return remember_failure(invalid("independent REF store audit names an inactive BOOM hart"));
+  return remember_failure(collectors_[store.id.hart]->audit_reference_store(
+      {store.id, store.address, store.bytes, store.byte_mask}));
+}
+
+CheckResult BoomNativeSource::completion() const {
+  if (!failure_)
+    return failure_;
+  if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
+      !events_.empty() || !snapshots_.empty())
+    return incomplete("BOOM native source still has undelivered events or snapshots");
+  for (const auto &collector : collectors_) {
+    if (!collector)
+      return incomplete("BOOM native hart never entered its independently initialized checked scope");
+    auto result = collector->completion();
+    if (!result)
+      return result;
+  }
+  return {};
+}
+} // namespace difftest_s::native
