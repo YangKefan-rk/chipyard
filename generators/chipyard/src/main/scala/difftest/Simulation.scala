@@ -107,7 +107,8 @@ class WithDifftestSNativeSimulation extends HarnessBinder({
     val observation = port.io
     val payload = NativePayload.pack(1, port.tileId, rosterSize, false,
       "core" -> observation.core, "cache" -> observation.cache,
-      "coreRequestor" -> observation.coreRequestor, "cacheRequestors" -> observation.cacheRequestors)
+      "coreRequestor" -> observation.coreRequestor, "cacheRequestors" -> observation.cacheRequestors,
+      "terminal" -> observation.terminal)
     val probe = Module(new DifftestSNativeProbe(1, port.tileId, rosterSize, payload.getWidth))
     probe.io.clock := observation.source.clock
     probe.io.reset := observation.source.reset

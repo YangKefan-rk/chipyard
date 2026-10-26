@@ -13,6 +13,14 @@ struct RocketDecoderConfiguration {
   uint32_t publication_producer = 0;
   // Zero checks the whole source. A nonzero entry explicitly excludes bootstrap.
   uint64_t entry_pc = 0;
+  bool require_terminal_observations = false;
+};
+
+struct RocketTerminalFacts {
+  bool wfi = false;
+  bool pipeline_empty = false;
+  bool pending_integer_writeback = false;
+  bool wfi_wake_pending = false;
 };
 
 struct RocketBootstrapCounts {
@@ -20,14 +28,6 @@ struct RocketBootstrapCounts {
   uint64_t loads = 0;
   uint64_t stores = 0;
   uint64_t traps = 0;
-};
-
-struct RocketTerminalFacts {
-  bool pipeline_empty = false;
-  bool pending_integer_writeback = false;
-  bool wfi_wake_pending = false;
-  bool wfi_retired = false;
-  uint64_t wfi_pc = 0;
 };
 
 struct RocketDecodedFrame {
@@ -38,8 +38,8 @@ struct RocketDecodedFrame {
   // prefix from every participating decoder. This is not a physical-idle proof.
   std::optional<uint64_t> publication_closed_through;
   bool tracked_work_drained = false;
-  std::optional<RocketTerminalFacts> terminal;
   std::optional<bool> physically_idle;
+  std::optional<RocketTerminalFacts> terminal;
 };
 
 // Allocates a unique fabric source identity at the observed drain edge. The

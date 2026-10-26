@@ -20,10 +20,15 @@ class DifftestSSource extends Bundle {
   val cycle = UInt(64.W)
 }
 
+class DifftestSRocketTerminal extends Bundle {
+  val wfi = Bool()
+}
+
 class DifftestSRocketObservation(coreType: RocketCoreObservation, cacheType: DCacheObservation) extends Bundle {
   val source = new DifftestSSource
   val core = coreType.cloneType
   val cache = cacheType.cloneType
+  val terminal = new DifftestSRocketTerminal
   val coreRequestor = UInt(32.W)
   val cacheRequestors = UInt(32.W)
 }
@@ -100,6 +105,7 @@ trait CanHaveDifftestSObservations { this: ChipyardSystem =>
           source(port.source, rocket.module.clock, rocket.module.reset)
           port.core := BoringUtils.bore(core)
           port.cache := BoringUtils.bore(cache)
+          port.terminal.wfi := BoringUtils.bore(rocket.module.core.io.wfi)
           port.coreRequestor := BoringUtils.bore(rocket.module.difftestCoreRequestor.get)
           port.cacheRequestors := BoringUtils.bore(rocket.module.difftestCacheRequestors.get)
           DifftestSRocketPort(() => port, tileId)

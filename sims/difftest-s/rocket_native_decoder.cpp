@@ -86,7 +86,6 @@ struct Fields {
   NativeFields metadata;
   NativeField hart, core_requestor, cache_requestors, cache_available;
   std::optional<NativeField> cache_idle;
-  std::optional<NativeField> pipeline_empty, pending_integer_writeback, wfi_wake_pending;
   ValidFields allocate, core_request, cache_request, s1_rejected, result, load, drain, retire, late_write, trap;
   InstructionFields allocation, retirement;
   AccessFields core_access, cache_access, result_access, load_access;
@@ -96,6 +95,7 @@ struct Fields {
   NativeField integer_write, deferred_write, destination, write_data, floating_point;
   NativeField retire_memory, retire_command, late_token, late_known, late_destination, late_data;
   NativeField execute_killed, execute_token, memory_killed, memory_token, wb_rejected, wb_token;
+  std::optional<NativeField> terminal_wfi, pipeline_empty, pending_integer_writeback, wfi_wake_pending;
 
   explicit Fields(const NativeProbeLayout &layout)
       : metadata(layout), hart(metadata.field("core.hart")),
@@ -129,24 +129,30 @@ struct Fields {
         execute_killed(metadata.field("core.executeKilled.valid")), execute_token(metadata.field("core.executeKilled.bits")),
         memory_killed(metadata.field("core.memoryKilled.valid")), memory_token(metadata.field("core.memoryKilled.bits")),
         wb_rejected(metadata.field("core.writebackRejected.valid")), wb_token(metadata.field("core.writebackRejected.bits")) {
+    auto optional_flag = [&](std::string_view path) -> std::optional<NativeField> {
+      for (size_t index = 0; index < layout.field_count; ++index) {
+        if (std::string_view(layout.fields[index].path) != path)
+          continue;
+        const auto field = metadata.field(path);
+        if (field.width != 1)
+          throw std::invalid_argument("Rocket terminal observation must have one bit: " + std::string(path));
+        return field;
+      }
+      return std::nullopt;
+    };
     for (size_t index = 0; index < layout.field_count; ++index)
       if (std::string_view(layout.fields[index].path) == "cache.idle") {
         cache_idle = metadata.field("cache.idle");
         if (cache_idle->width != 1)
           throw std::invalid_argument("Rocket physical cache-idle proof must have one bit");
       }
-    auto optional_flag = [&](const char *path) -> std::optional<NativeField> {
-      for (size_t index = 0; index < layout.field_count; ++index)
-        if (std::string_view(layout.fields[index].path) == path)
-          return metadata.field(path);
-      return std::nullopt;
-    };
+    terminal_wfi = optional_flag("terminal.wfi");
     pipeline_empty = optional_flag("core.pipelineEmpty");
     pending_integer_writeback = optional_flag("core.pendingIntegerWriteback");
     wfi_wake_pending = optional_flag("core.wfiWakePending");
-    const bool any_terminal = pipeline_empty || pending_integer_writeback || wfi_wake_pending;
-    const bool all_terminal = pipeline_empty && pending_integer_writeback && wfi_wake_pending;
-    if (any_terminal && !all_terminal)
+    const bool any_terminal_field = terminal_wfi || pipeline_empty || pending_integer_writeback || wfi_wake_pending;
+    const bool all_terminal_fields = terminal_wfi && pipeline_empty && pending_integer_writeback && wfi_wake_pending;
+    if (any_terminal_field && !all_terminal_fields)
       throw std::invalid_argument("Rocket native layout has a partial terminal observation set");
   }
 };
@@ -193,6 +199,9 @@ struct RocketNativeDecoder::State {
     if (metadata.kind != 1 || !metadata.harts || metadata.hart >= metadata.harts || config.capacity < 3 ||
         config.publication_producer < rvwmo::kMemoryFabricProducerBase || !publication_source)
       throw std::invalid_argument("Rocket native decoder requires a valid layout, fabric producer and bounded capacity");
+    if (config.require_terminal_observations && (!fields.terminal_wfi || !fields.cache_idle))
+      failure = {CheckStatus::Unsupported, 0,
+                 "Rocket WFI terminal checking requires WFI, pipeline, writeback, wake, and cache-idle observations"};
   }
 
   SourcePosition source(uint64_t cycle) {
@@ -602,17 +611,12 @@ struct RocketNativeDecoder::State {
       close_prefix(frame.source_cycle);
       if (fields.cache_idle)
         staged.physically_idle = fields.cache_idle->read(sample);
-      if (fields.pipeline_empty) {
-        RocketTerminalFacts facts;
-        facts.pipeline_empty = fields.pipeline_empty->read(sample);
-        facts.pending_integer_writeback = fields.pending_integer_writeback->read(sample);
-        facts.wfi_wake_pending = fields.wfi_wake_pending->read(sample);
-        for (const auto &snapshot : staged.retirements)
-          if (snapshot.instruction == UINT32_C(0x10500073)) {
-            facts.wfi_retired = true;
-            facts.wfi_pc = snapshot.pc;
-          }
-        staged.terminal = facts;
+      if (fields.terminal_wfi) {
+        staged.terminal = RocketTerminalFacts{
+            static_cast<bool>(fields.terminal_wfi->read(sample)),
+            static_cast<bool>(fields.pipeline_empty->read(sample)),
+            static_cast<bool>(fields.pending_integer_writeback->read(sample)),
+            static_cast<bool>(fields.wfi_wake_pending->read(sample))};
       }
       output = nullptr;
       converted = std::move(staged);
