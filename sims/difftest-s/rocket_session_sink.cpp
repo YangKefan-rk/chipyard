@@ -61,6 +61,7 @@ public:
     initialized_registers_.resize(layout->harts);
     publication_sequences_.resize(layout->harts);
     source_prefixes_.resize(layout->harts * 2);
+    terminal_states_.resize(layout->harts);
     const std::vector<rvwmo::RuntimeEventKind> hart_kinds = {
       rvwmo::RuntimeEventKind::InstructionAllocate, rvwmo::RuntimeEventKind::InstructionRetire,
       rvwmo::RuntimeEventKind::InstructionCancelAttempt, rvwmo::RuntimeEventKind::InstructionSquash,
@@ -122,12 +123,41 @@ public:
         source_prefixes_[hart * 2] = *ready.hart_closed_through;
       if (ready.publication_closed_through)
         source_prefixes_[hart * 2 + 1] = *ready.publication_closed_through;
+      if (ready.terminal) {
+        auto &terminal = terminal_states_[hart];
+        if (ready.terminal->wfi_retired) {
+          terminal.retired = true;
+          terminal.cycle = frame.source_cycle;
+        }
+        terminal.ready = terminal.retired && ready.terminal->pipeline_empty &&
+                         !ready.terminal->pending_integer_writeback &&
+                         !ready.terminal->wfi_wake_pending && ready.physically_idle &&
+                         *ready.physically_idle && ready.tracked_work_drained;
+      }
     }
     if (frame.reset)
       return {CheckStatus::Pending, 0, "Rocket source is in reset"};
     auto result = submit_closed_prefix();
     if (!result && result.status != CheckStatus::Pending)
       return fail(result);
+    bool all_terminal = !terminal_states_.empty();
+    for (const auto &terminal : terminal_states_)
+      all_terminal = all_terminal && terminal.ready;
+    if (all_terminal && staged_events_.empty() && staged_retirements_.empty() && !terminal_finalized_) {
+      for (uint32_t hart = 0; hart < decoders_.size(); ++hart) {
+        auto completed = session_->complete_hart({hart, terminal_states_[hart].cycle, 0});
+        if (!completed) return fail(completed);
+        auto drained = session_->drain_producer({rvwmo::hart_producer_id(hart), cycle_, true, true});
+        if (!drained) return fail(drained);
+        drained = session_->drain_producer({rvwmo::memory_fabric_producer_id(hart), cycle_, true, true});
+        if (!drained) return fail(drained);
+      }
+      terminal_finalized_ = true;
+      final_result_ = session_->finalize(cycle_);
+      if (!final_result_) return fail(final_result_);
+      std::fprintf(stderr, "DIFFTEST_S_FINAL %s\n", session_->final_report().c_str());
+      Verilated::gotFinish(true);
+    }
     return result;
   }
 
@@ -167,10 +197,13 @@ private:
   std::vector<rvwmo::RuntimeEvent> staged_events_;
   std::map<rvwmo::OperationId, rvwmo::ArchitecturalRetirement> staged_retirements_;
   std::vector<uint64_t> source_prefixes_;
+  struct TerminalState { bool retired=false; bool ready=false; uint64_t cycle=0; };
+  std::vector<TerminalState> terminal_states_;
   std::optional<uint64_t> submitted_prefix_;
   uint64_t cycle_ = 0;
   CheckResult failure_, final_result_;
   bool finalized_ = false;
+  bool terminal_finalized_ = false;
   bool elf_scope_ = false;
 
   CheckResult fail(const CheckResult &result) {

@@ -22,6 +22,14 @@ struct RocketBootstrapCounts {
   uint64_t traps = 0;
 };
 
+struct RocketTerminalFacts {
+  bool pipeline_empty = false;
+  bool pending_integer_writeback = false;
+  bool wfi_wake_pending = false;
+  bool wfi_retired = false;
+  uint64_t wfi_pc = 0;
+};
+
 struct RocketDecodedFrame {
   rvwmo::EventBatch batch;
   std::vector<rvwmo::ArchitecturalRetirement> retirements;
@@ -30,6 +38,7 @@ struct RocketDecodedFrame {
   // prefix from every participating decoder. This is not a physical-idle proof.
   std::optional<uint64_t> publication_closed_through;
   bool tracked_work_drained = false;
+  std::optional<RocketTerminalFacts> terminal;
   std::optional<bool> physically_idle;
 };
 

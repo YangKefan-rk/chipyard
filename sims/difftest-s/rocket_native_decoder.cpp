@@ -86,6 +86,7 @@ struct Fields {
   NativeFields metadata;
   NativeField hart, core_requestor, cache_requestors, cache_available;
   std::optional<NativeField> cache_idle;
+  std::optional<NativeField> pipeline_empty, pending_integer_writeback, wfi_wake_pending;
   ValidFields allocate, core_request, cache_request, s1_rejected, result, load, drain, retire, late_write, trap;
   InstructionFields allocation, retirement;
   AccessFields core_access, cache_access, result_access, load_access;
@@ -134,6 +135,19 @@ struct Fields {
         if (cache_idle->width != 1)
           throw std::invalid_argument("Rocket physical cache-idle proof must have one bit");
       }
+    auto optional_flag = [&](const char *path) -> std::optional<NativeField> {
+      for (size_t index = 0; index < layout.field_count; ++index)
+        if (std::string_view(layout.fields[index].path) == path)
+          return metadata.field(path);
+      return std::nullopt;
+    };
+    pipeline_empty = optional_flag("core.pipelineEmpty");
+    pending_integer_writeback = optional_flag("core.pendingIntegerWriteback");
+    wfi_wake_pending = optional_flag("core.wfiWakePending");
+    const bool any_terminal = pipeline_empty || pending_integer_writeback || wfi_wake_pending;
+    const bool all_terminal = pipeline_empty && pending_integer_writeback && wfi_wake_pending;
+    if (any_terminal && !all_terminal)
+      throw std::invalid_argument("Rocket native layout has a partial terminal observation set");
   }
 };
 } // namespace
@@ -588,6 +602,18 @@ struct RocketNativeDecoder::State {
       close_prefix(frame.source_cycle);
       if (fields.cache_idle)
         staged.physically_idle = fields.cache_idle->read(sample);
+      if (fields.pipeline_empty) {
+        RocketTerminalFacts facts;
+        facts.pipeline_empty = fields.pipeline_empty->read(sample);
+        facts.pending_integer_writeback = fields.pending_integer_writeback->read(sample);
+        facts.wfi_wake_pending = fields.wfi_wake_pending->read(sample);
+        for (const auto &snapshot : staged.retirements)
+          if (snapshot.instruction == UINT32_C(0x10500073)) {
+            facts.wfi_retired = true;
+            facts.wfi_pc = snapshot.pc;
+          }
+        staged.terminal = facts;
+      }
       output = nullptr;
       converted = std::move(staged);
       return {};
