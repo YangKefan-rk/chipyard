@@ -19,6 +19,9 @@ def validate_layout(layout):
     harts = bounded_integer(layout, 'harts', 1, 256)
     hart = bounded_integer(layout, 'hart', 0, harts - 1)
     bits = bounded_integer(layout, 'bits', 1, 1 << 20)
+    certificate = layout.get('sram_capture_boundary', False)
+    if type(certificate) is not bool or (certificate and kind != 2):
+        raise ValueError('invalid BOOM SRAM capture-boundary certificate')
     if not isinstance(layout['fields'], list) or not layout['fields']:
         raise ValueError('native layout has no fields')
     offset = 0
@@ -65,7 +68,8 @@ def generate(layouts):
             lines.append(f'  {{{path}, {field["offset"]}, {field["width"]}}},')
         lines += ['};', f'static constexpr NativeProbeLayout layout_{label} = {{',
                   f'  1, {layout["kind"]}, {layout["hart"]}, {layout["harts"]}, {layout["bits"]},',
-                  f'  sizeof(fields_{label}) / sizeof(fields_{label}[0]), fields_{label}', '};']
+                  f'  sizeof(fields_{label}) / sizeof(fields_{label}[0]), fields_{label},',
+                  '  ' + str(layout.get('sram_capture_boundary', False)).lower(), '};']
     lines += ['} // namespace', '',
               'const NativeProbeLayout *find_native_layout(uint32_t kind, uint32_t hart) {']
     for kind, hart in sorted(keys):

@@ -19,7 +19,8 @@ private object NativePayload {
     case other => throw new IllegalArgumentException(s"Unsupported Difftest-S native field $path: ${other.getClass.getName}")
   }
 
-  def pack(kind: Int, hart: Int, rosterSize: Int, records: (String, Data)*): UInt = {
+  def pack(kind: Int, hart: Int, rosterSize: Int, sramCaptureBoundary: Boolean,
+           records: (String, Data)*): UInt = {
     var offset = 0
     val fields = records.flatMap { case (path, signal) => leaves(path, signal) }.map { case (path, signal) =>
       require(signal.getWidth > 0 && signal.getWidth <= 64, s"Difftest-S native field $path has unsupported width")
@@ -38,14 +39,14 @@ private object NativePayload {
         |};
         |inline constexpr NativeProbeLayout layout_$label = {
         |  1, $kind, $hart, $rosterSize, $offset,
-        |  sizeof(fields_$label) / sizeof(fields_$label[0]), fields_$label
+        |  sizeof(fields_$label) / sizeof(fields_$label[0]), fields_$label, $sramCaptureBoundary
         |};
         |}
         |""".stripMargin
     val jsonFields = fields.map(f => s"{\"path\":\"${f.path}\",\"offset\":${f.offset},\"width\":${f.width}}").mkString(",")
     ElaborationArtefacts.add(s"difftest-s-layout-$label.h", header)
     ElaborationArtefacts.add(s"difftest-s-layout-$label.json",
-      s"{\"abi\":1,\"kind\":$kind,\"hart\":$hart,\"harts\":$rosterSize,\"bits\":$offset,\"fields\":[$jsonFields]}")
+      s"{\"abi\":1,\"kind\":$kind,\"hart\":$hart,\"harts\":$rosterSize,\"bits\":$offset,\"sram_capture_boundary\":$sramCaptureBoundary,\"fields\":[$jsonFields]}")
     Cat(fields.reverse.map(_.signal))
   }
 }
@@ -91,7 +92,7 @@ class WithDifftestSNativeSimulation extends HarnessBinder({
     require(chipId == 0, "Difftest-S native transport currently supports one chip")
     val rosterSize = harness.chipParameters(chipId)(freechips.rocketchip.subsystem.NumTiles)
     val observation = port.io
-    val payload = NativePayload.pack(2, port.tileId, rosterSize,
+    val payload = NativePayload.pack(2, port.tileId, rosterSize, port.sramCaptureBoundary,
       "core" -> observation.core, "lsu" -> observation.lsu, "cache" -> observation.cache)
     val probe = Module(new DifftestSNativeProbe(2, port.tileId, rosterSize, payload.getWidth))
     probe.io.clock := observation.source.clock
@@ -104,7 +105,7 @@ class WithDifftestSNativeSimulation extends HarnessBinder({
     require(chipId == 0, "Difftest-S native transport currently supports one chip")
     val rosterSize = harness.chipParameters(chipId)(freechips.rocketchip.subsystem.NumTiles)
     val observation = port.io
-    val payload = NativePayload.pack(1, port.tileId, rosterSize,
+    val payload = NativePayload.pack(1, port.tileId, rosterSize, false,
       "core" -> observation.core, "cache" -> observation.cache,
       "coreRequestor" -> observation.coreRequestor, "cacheRequestors" -> observation.cacheRequestors)
     val probe = Module(new DifftestSNativeProbe(1, port.tileId, rosterSize, payload.getWidth))

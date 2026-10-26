@@ -86,13 +86,14 @@ struct AttemptFields : RecordFields {
 
 struct LoadFields : RecordFields {
   NativeField index, address, word, size, mask, writer_mask, source_valid, source_kind;
+  bool sram_capture_boundary;
   std::vector<IdentityFields> writers;
-  LoadFields(const NativeFields &fields, const std::string &path)
+  LoadFields(const NativeFields &fields, const std::string &path, bool capture_boundary = false)
       : RecordFields(fields, path), index(fields.field(path + ".bits.queue_index")),
         address(fields.field(path + ".bits.address")), word(fields.field(path + ".bits.raw_word")),
         size(fields.field(path + ".bits.mem_size")), mask(fields.field(path + ".bits.byte_mask")),
         writer_mask(fields.field(path + ".bits.writer_mask")), source_valid(fields.field(path + ".bits.source_valid")),
-        source_kind(fields.field(path + ".bits.source_kind")) {
+        source_kind(fields.field(path + ".bits.source_kind")), sram_capture_boundary(capture_boundary) {
     for (unsigned byte = 0; byte < 8; ++byte)
       writers.emplace_back(fields, path + ".bits.writers[" + std::to_string(byte) + ']');
   }
@@ -119,11 +120,11 @@ struct LoadFields : RecordFields {
     probe.source_complete = source_valid.read(sample) &&
                             probe.sampling_point != boom::LoadSamplingPoint::Unavailable;
     result.sampled_at.cycle = cycle.read(sample);
-    // Under the selected shared physical clock, pipeline/STQ/line-buffer
-    // forwarding selects existing register values before the active array-write
-    // edge. These are phase 0; the SRAM request alone does not prove whether
-    // its selected row was sampled before or after a concurrent write.
-    result.sampled_at.order_qualified = kind == 2 || kind == 3 || kind == 4;
+    // Under the shared physical clock, pipeline/STQ/line-buffer forwarding
+    // selects existing registers before the active array-write edge. SRAM
+    // gains the same phase only with the generator's explicit capture-boundary
+    // certificate; its source cycle still comes unchanged from the DUT.
+    result.sampled_at.order_qualified = (kind == 1 && sram_capture_boundary) || kind == 2 || kind == 3 || kind == 4;
     return result;
   }
 };
@@ -151,11 +152,11 @@ struct SquashFields : RecordFields {
   }
 };
 
-template <class Fields>
-std::vector<Fields> vector_fields(const NativeFields &fields, std::string_view group) {
+template <class Fields, class... Options>
+std::vector<Fields> vector_fields(const NativeFields &fields, std::string_view group, Options... options) {
   std::vector<Fields> result;
   for (const auto &path : fields.records(group))
-    result.emplace_back(fields, path);
+    result.emplace_back(fields, path, options...);
   return result;
 }
 
@@ -198,7 +199,7 @@ struct BoomNativeDecoder::Fields {
         cancel(vector_fields<AttemptFields>(metadata, "lsu.cancel")),
         nack(vector_fields<AttemptFields>(metadata, "lsu.nack")),
         retired_load(vector_fields<AttemptFields>(metadata, "lsu.retire_load")),
-        complete(vector_fields<LoadFields>(metadata, "lsu.complete")),
+        complete(vector_fields<LoadFields>(metadata, "lsu.complete", source.sram_capture_boundary)),
         local_store(vector_fields<StoreFields>(metadata, "lsu.local_store")),
         squash(vector_fields<SquashFields>(metadata, "core.squash")),
         release(metadata, "lsu.store_release"), publication(metadata, "cache.store_applied") {

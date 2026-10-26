@@ -38,7 +38,8 @@ class DifftestSBoomObservation(coreWidth: Int, robEntries: Int, lsuWidth: Int) e
 case class DifftestSRocketPort(getIO: () => DifftestSRocketObservation, tileId: Int)
     extends Port[DifftestSRocketObservation]
 
-case class DifftestSBoomPort(getIO: () => DifftestSBoomObservation, tileId: Int)
+case class DifftestSBoomPort(getIO: () => DifftestSBoomObservation, tileId: Int,
+                            sramCaptureBoundary: Boolean = false)
     extends Port[DifftestSBoomObservation]
 
 /** Private DUT observations. The source clock is exported; no receive-time
@@ -116,7 +117,8 @@ trait CanHaveDifftestSObservations { this: ChipyardSystem =>
           val control = boomControls(tileId).getWrappedValue
           BoringUtils.bore(port.source.epoch, Seq(control.epoch))
           BoringUtils.bore(port.source.cycle, Seq(control.cycle))
-          DifftestSBoomPort(() => port, tileId)
+          DifftestSBoomPort(() => port, tileId,
+            core.difftestSramCaptureBoundary && core.numDCacheBanks == 1 && !core.dcacheSinglePorted)
 
         case other =>
           throw new IllegalArgumentException(s"Difftest-S observation export does not support ${other.getClass.getName}")
@@ -137,7 +139,7 @@ class WithDifftestSObservationPunchthrough extends OverrideLazyIOBinder({
         val port = IO(Output(chiselTypeOf(boom.getIO())))
           .suggestName(s"difftest_s_boom_${boom.tileId}")
         port := boom.getIO()
-        DifftestSBoomPort(() => port, boom.tileId)
+        DifftestSBoomPort(() => port, boom.tileId, boom.sramCaptureBoundary)
     }
     (ports, Nil)
   }

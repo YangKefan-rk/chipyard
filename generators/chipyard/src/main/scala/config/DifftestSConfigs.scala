@@ -26,11 +26,12 @@ class DualRocketDifftestSConfig extends Config(
   new DualRocketConfig
 )
 
-class WithDifftestSBoomObservations extends Config((site, here, up) => {
+class WithDifftestSBoomObservations(sramCaptureBoundary: Boolean = false) extends Config((site, here, up) => {
   case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site).map {
     case tile: boom.v4.common.BoomTileAttachParams =>
       tile.copy(tileParams = tile.tileParams.copy(
-        core = tile.tileParams.core.copy(enableDifftest = true)
+        core = tile.tileParams.core.copy(
+          enableDifftest = true, difftestSramCaptureBoundary = sramCaptureBoundary)
       ))
     case other => other
   }
@@ -42,7 +43,7 @@ class DualSmallBoomV4DifftestSConfig extends Config(
   new chipyard.config.WithNoTileClockGaters ++
   new chipyard.config.WithNoTileResetSetters ++
   new boom.v4.common.WithSynchronousBoomTiles ++
-  new WithDifftestSBoomObservations ++
+  new WithDifftestSBoomObservations(sramCaptureBoundary = true) ++
   new DualSmallBoomV4Config
 )
 
@@ -63,7 +64,7 @@ class QuadSmallBoomV4DifftestSConfig extends Config(
   new chipyard.config.WithNoTileClockGaters ++
   new chipyard.config.WithNoTileResetSetters ++
   new boom.v4.common.WithSynchronousBoomTiles ++
-  new WithDifftestSBoomObservations ++
+  new WithDifftestSBoomObservations(sramCaptureBoundary = true) ++
   new boom.v4.common.WithNSmallBooms(4) ++
   new chipyard.config.AbstractConfig
 )

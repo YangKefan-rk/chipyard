@@ -23,6 +23,9 @@ struct NativeProbeLayout {
   uint32_t payload_bits;
   size_t field_count;
   const NativeFieldSpec *fields;
+  // Generator certificate for the selected BOOM duplicated-array macro. Legacy
+  // layouts default false; it never changes a DUT-supplied sampling cycle.
+  bool sram_capture_boundary = false;
 };
 
 struct NativeHartSample {
