@@ -41,7 +41,9 @@ void select_entry_scope(boom::NativeFrame &frame, uint64_t entry_uid) {
 
 BoomNativeSource::BoomNativeSource(BoomNativeSourceConfiguration configuration)
     : configuration_(std::move(configuration)), collectors_(configuration_.entry_pcs.size()),
-      entry_uids_(collectors_.size()), watermarks_(collectors_.size()), bootstrap_(collectors_.size()) {
+      entry_uids_(collectors_.size()), watermarks_(collectors_.size()), bootstrap_(collectors_.size()),
+      terminal_facts_(collectors_.size()), terminal_retirements_(collectors_.size()),
+      terminal_retirement_cycles_(collectors_.size()) {
   if (!configuration_.epoch || collectors_.empty() || collectors_.size() > 256 || !configuration_.staged_events)
     throw std::invalid_argument("BOOM native source requires a bounded hart roster, epoch and staging limit");
   for (uint32_t hart = 0; hart < collectors_.size(); ++hart) {
@@ -75,6 +77,8 @@ CheckResult BoomNativeSource::capture(const NativeFrame &frame) {
   for (uint32_t hart = 0; hart < collectors_.size(); ++hart) {
     boom::NativeFrame decoded;
     auto result = decoders_[hart]->decode(frame, decoded);
+    if (result)
+      result = decoders_[hart]->terminal(frame, terminal_facts_[hart]);
     if (!result || !(result = capture_hart(std::move(decoded))))
       return remember_failure(result);
   }
@@ -114,6 +118,31 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame) {
     }
   }
   select_entry_scope(frame, entry_uids_[hart]);
+  if (configuration_.terminal_pc) {
+    const auto &facts = terminal_facts_[hart];
+    if (!facts.armed || facts.configured_pc != configuration_.terminal_pc)
+      return invalid("BOOM DUT terminal policy differs from the independently configured PC");
+    for (const auto &retirement : frame.retirements) {
+      if (terminal_retirements_[hart])
+        return invalid("BOOM architectural instruction retires after its terminal marker");
+      if (retirement.architectural && retirement.pc == configuration_.terminal_pc &&
+          retirement.instruction == 0x0000100f) {
+        terminal_retirements_[hart] = retirement;
+        terminal_retirement_cycles_[hart] = frame.cycle;
+      }
+    }
+    if (facts.reached) {
+      if (!terminal_retirements_[hart] || !facts.stopped ||
+          facts.marker.uid != terminal_retirements_[hart]->identity.uid ||
+          facts.marker.epoch != terminal_retirements_[hart]->identity.epoch ||
+          facts.marker.rob_generation != terminal_retirements_[hart]->identity.rob_generation ||
+          facts.marker.memory_generation != terminal_retirements_[hart]->identity.memory_generation ||
+          facts.marker.attempt != terminal_retirements_[hart]->identity.attempt ||
+          facts.marker_pc != configuration_.terminal_pc || facts.marker_instruction != 0x0000100f ||
+          facts.marker_cycle != terminal_retirement_cycles_[hart])
+        return invalid("BOOM stopped marker lacks its original actual architectural retirement");
+    }
+  }
   const auto captured = collectors_[hart]->capture(frame);
   if (!captured.accepted)
     return captured.check.status == CheckStatus::Pending
@@ -208,6 +237,13 @@ CheckResult BoomNativeSource::completion() const {
   if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
       !events_.empty() || !snapshots_.empty())
     return incomplete("BOOM native source still has undelivered events or snapshots");
+  if (configuration_.terminal_pc)
+    for (uint32_t hart = 0; hart < collectors_.size(); ++hart) {
+      const auto &facts = terminal_facts_[hart];
+      if (!terminal_retirements_[hart] || !facts.reached || !facts.stopped || !facts.core_empty ||
+          facts.writeback_active || facts.interrupt_pending || facts.source_cycle != *captured_cycle_)
+        return incomplete("BOOM terminal retirement or current physical core drain is incomplete");
+    }
   for (const auto &collector : collectors_) {
     if (!collector)
       return incomplete("BOOM native hart never entered its independently initialized checked scope");

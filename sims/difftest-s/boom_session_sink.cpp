@@ -46,7 +46,20 @@ public:
     if (!loaded)
       throw std::invalid_argument("independent reference ELF: " + loaded.message);
 
+    terminal_pc_ = configured_number("DIFFTEST_S_BOOM_TERMINAL_PC", 0);
+    if (terminal_pc_) {
+      success_address_ = configured_number("DIFFTEST_S_BOOM_SUCCESS_ADDRESS", 0);
+      const char *success = std::getenv("DIFFTEST_S_BOOM_SUCCESS_VALUE");
+      if (!success_address_ || !success || !*success)
+        throw std::invalid_argument("BOOM terminal policy requires an independent success word address and value");
+      success_value_ = configured_number("DIFFTEST_S_BOOM_SUCCESS_VALUE", 0);
+      std::array<uint8_t, 4> marker{};
+      if (!memory_.read(terminal_pc_, marker.data(), marker.size()) ||
+          marker != std::array<uint8_t, 4>{0x0f, 0x10, 0, 0})
+        throw std::invalid_argument("BOOM terminal PC is not an independently initialized canonical FENCE.I");
+    }
     BoomNativeSourceConfiguration source_config;
+    source_config.terminal_pc = terminal_pc_;
     source_config.entry_pcs.assign(layout->harts, entry);
     // Exact native Small BOOM V4 profile: ROB32/LDQ8/STQ8. Other configurations
     // require their real capacity metadata rather than the adapter maximums.
@@ -62,6 +75,7 @@ public:
     config.reference_profile = DIFFTEST_REF_PROFILE_ID_BOOM;
     config.initial_harts.resize(layout->harts);
     initialized_registers_.resize(layout->harts);
+    submitted_markers_.resize(layout->harts);
     const std::vector<rvwmo::RuntimeEventKind> hart_kinds = {
       rvwmo::RuntimeEventKind::InstructionAllocate, rvwmo::RuntimeEventKind::InstructionRetire,
       rvwmo::RuntimeEventKind::InstructionCancelAttempt, rvwmo::RuntimeEventKind::InstructionSquash,
@@ -102,8 +116,32 @@ public:
       result = source_->take_ready(ready);
       if (result)
         result = validate_entry_registers(ready.retirements);
-      if (result)
-        result = session_->submit(ready.batch, ready.retirements).check;
+      if (result) {
+        const auto submitted = session_->submit(ready.batch, ready.retirements);
+        result = submitted.check;
+        // Acceptance owns these snapshots even when an earlier semantic fact
+        // keeps REF pending. Completion below still requires a successful poll.
+        if (submitted.accepted && (result || result.status == CheckStatus::Pending))
+          for (const auto &event : ready.batch.events) {
+            if (event.kind != rvwmo::RuntimeEventKind::InstructionRetire)
+              continue;
+            const auto &instruction = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction;
+            for (const auto &snapshot : ready.retirements)
+              if (snapshot.id.hart == instruction.hart && snapshot.id.epoch == instruction.epoch &&
+                  snapshot.id.uid == instruction.uid &&
+                  snapshot.pc == terminal_pc_ && snapshot.instruction == 0x0000100f)
+                submitted_markers_[instruction.hart] = SubmittedTerminalMarker{snapshot.id, event.source.cycle};
+          }
+      }
+      if (result && terminal_pc_) {
+        auto terminal = complete_terminal();
+        if (terminal) {
+          completed_ = true;
+          Verilated::gotFinish(true);
+        } else if (terminal.status != CheckStatus::Incomplete && terminal.status != CheckStatus::Pending) {
+          result = terminal;
+        }
+      }
     }
     if (!result && result.status != CheckStatus::Pending) {
       failure_ = result;
@@ -145,7 +183,49 @@ private:
   std::unique_ptr<rvwmo::HostSession> session_;
   uint64_t cycle_ = 0;
   CheckResult failure_;
+  uint64_t terminal_pc_ = 0;
+  uint64_t success_address_ = 0, success_value_ = 0;
+  bool completed_ = false;
+  struct SubmittedTerminalMarker { rvwmo::OperationId id; uint64_t source_cycle; };
+  std::vector<std::optional<SubmittedTerminalMarker>> submitted_markers_;
   std::vector<std::array<bool, 32>> initialized_registers_;
+
+  CheckResult complete_terminal() {
+    if (completed_)
+      return {};
+    for (const auto &marker : submitted_markers_)
+      if (!marker)
+        return {CheckStatus::Incomplete, 0, "BOOM terminal marker has not been accepted for every hart REF comparison"};
+    auto result = source_->completion();
+    if (!result)
+      return result;
+    result = session_->poll();
+    if (!result)
+      return result;
+    std::array<uint8_t, 8> success_bytes{};
+    if (!memory_.read(success_address_, success_bytes.data(), success_bytes.size()))
+      return {CheckStatus::Invalid, 0, "BOOM success word is outside independently initialized RAM"};
+    uint64_t success_word = 0;
+    for (size_t byte = 0; byte < success_bytes.size(); ++byte)
+      success_word |= static_cast<uint64_t>(success_bytes[byte]) << (byte * 8);
+    if (success_word != success_value_)
+      return {CheckStatus::Violation, 0, "BOOM workload success word differs from its independent expected value"};
+    const auto &facts = source_->terminal_facts();
+    for (uint32_t hart = 0; hart < facts.size(); ++hart) {
+      result = session_->complete_hart({hart, submitted_markers_[hart]->source_cycle, 0});
+      if (!result)
+        return result;
+    }
+    for (uint32_t hart = 0; hart < facts.size(); ++hart) {
+      result = session_->drain_producer({rvwmo::hart_producer_id(hart), cycle_, true, true});
+      if (!result)
+        return result;
+      result = session_->drain_producer({rvwmo::memory_fabric_producer_id(hart), cycle_, true, true});
+      if (!result)
+        return result;
+    }
+    return {};
+  }
 
   CheckResult validate_entry_registers(const std::vector<rvwmo::ArchitecturalRetirement> &retirements) {
     for (const auto &retirement : retirements) {

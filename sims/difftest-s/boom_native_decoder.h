@@ -11,11 +11,22 @@ namespace difftest_s::native {
 // It must be unique across all BOOM harts sharing the registered fabric channel.
 using BoomPublicationSource = std::function<rvwmo::boom::EventSource(uint64_t)>;
 
+struct BoomTerminalFacts {
+  bool armed = false, reached = false, stopped = false;
+  bool core_empty = false, writeback_active = false, interrupt_pending = false;
+  uint64_t configured_pc = 0, source_cycle = 0, marker_cycle = 0;
+  rvwmo::boom::ProbeIdentity marker;
+  uint64_t marker_pc = 0;
+  uint32_t marker_instruction = 0;
+};
+
 class BoomNativeDecoder {
 public:
   BoomNativeDecoder(const NativeProbeLayout &layout, BoomPublicationSource publication_source);
   ~BoomNativeDecoder();
   rvwmo::CheckResult decode(const NativeFrame &source, rvwmo::boom::NativeFrame &output) const;
+
+  rvwmo::CheckResult terminal(const NativeFrame &source, BoomTerminalFacts &output) const;
 
 private:
   struct Fields;

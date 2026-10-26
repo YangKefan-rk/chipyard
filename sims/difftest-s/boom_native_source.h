@@ -19,6 +19,7 @@ struct BoomNativeSourceConfiguration {
   // The caller independently initializes each REF at this same entry PC. Boot
   // instructions preceding this selected scope are counted as uncovered.
   std::vector<uint64_t> entry_pcs;
+  uint64_t terminal_pc = 0;
   rvwmo::boom::AdapterLimits limits;
   size_t staged_events = 65536;
 };
@@ -34,6 +35,7 @@ public:
   rvwmo::CheckResult take_ready(rvwmo::boom::CollectedObservations &output);
   rvwmo::CheckResult audit_reference_store(const rvwmo::ReferenceStoreValue &store);
   rvwmo::CheckResult completion() const;
+  const std::vector<BoomTerminalFacts> &terminal_facts() const { return terminal_facts_; }
   const std::vector<UncheckedBootstrap> &unchecked_bootstrap() const { return bootstrap_; }
 
 private:
@@ -43,6 +45,9 @@ private:
   std::vector<uint64_t> entry_uids_;
   std::vector<uint64_t> watermarks_;
   std::vector<UncheckedBootstrap> bootstrap_;
+  std::vector<BoomTerminalFacts> terminal_facts_;
+  std::vector<std::optional<rvwmo::boom::ProbeInstruction>> terminal_retirements_;
+  std::vector<uint64_t> terminal_retirement_cycles_;
   std::vector<rvwmo::RuntimeEvent> events_;
   std::map<rvwmo::OperationId, rvwmo::ArchitecturalRetirement> snapshots_;
   std::optional<uint64_t> captured_cycle_;

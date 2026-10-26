@@ -187,6 +187,9 @@ struct BoomNativeDecoder::Fields {
   std::vector<NativeField> retire_data;
   AttemptFields release;
   StoreFields publication;
+  NativeField terminal_armed, terminal_pc, terminal_reached, terminal_stopped, terminal_empty;
+  NativeField terminal_writeback, terminal_interrupt, terminal_cycle, marker_cycle, marker_pc, marker_instruction;
+  IdentityFields marker_identity;
 
   Fields(const NativeProbeLayout &source, BoomPublicationSource publications)
       : layout(&source), publication_source(std::move(publications)), metadata(source),
@@ -202,7 +205,17 @@ struct BoomNativeDecoder::Fields {
         complete(vector_fields<LoadFields>(metadata, "lsu.complete", source.sram_capture_boundary)),
         local_store(vector_fields<StoreFields>(metadata, "lsu.local_store")),
         squash(vector_fields<SquashFields>(metadata, "core.squash")),
-        release(metadata, "lsu.store_release"), publication(metadata, "cache.store_applied") {
+        release(metadata, "lsu.store_release"), publication(metadata, "cache.store_applied"),
+        terminal_armed(metadata.field("core.terminal.armed")), terminal_pc(metadata.field("core.terminal.configured_pc")),
+        terminal_reached(metadata.field("core.terminal.reached")), terminal_stopped(metadata.field("core.terminal.stopped")),
+        terminal_empty(metadata.field("core.terminal.core_empty")),
+        terminal_writeback(metadata.field("core.terminal.writeback_active")),
+        terminal_interrupt(metadata.field("core.terminal.interrupt_pending")),
+        terminal_cycle(metadata.field("core.terminal.source_cycle")),
+        marker_cycle(metadata.field("core.terminal.marker.source_cycle")),
+        marker_pc(metadata.field("core.terminal.marker.pc")),
+        marker_instruction(metadata.field("core.terminal.marker.instruction")),
+        marker_identity(metadata, "core.terminal.marker.identity") {
     if (source.kind != 2 || !publication_source)
       throw std::invalid_argument("BOOM native decoder requires BOOM metadata and a fabric source allocator");
     for (size_t lane = 0; lane < retired_load.size(); ++lane)
@@ -277,6 +290,22 @@ rvwmo::CheckResult BoomNativeDecoder::decode(const NativeFrame &source, boom::Na
     output = std::move(frame);
     return {};
   } catch (const std::invalid_argument &error) {
+    return {rvwmo::CheckStatus::Invalid, 0, error.what()};
+  }
+}
+rvwmo::CheckResult BoomNativeDecoder::terminal(const NativeFrame &source, BoomTerminalFacts &output) const {
+  try {
+    const auto &sample = source.samples.at(fields_->layout->hart);
+    output = {bool(fields_->terminal_armed.read(sample)), bool(fields_->terminal_reached.read(sample)),
+      bool(fields_->terminal_stopped.read(sample)), bool(fields_->terminal_empty.read(sample)),
+      bool(fields_->terminal_writeback.read(sample)), bool(fields_->terminal_interrupt.read(sample)),
+      fields_->terminal_pc.read(sample), fields_->terminal_cycle.read(sample), fields_->marker_cycle.read(sample),
+      fields_->marker_identity.read(sample), fields_->marker_pc.read(sample),
+      static_cast<uint32_t>(fields_->marker_instruction.read(sample))};
+    if (output.source_cycle != source.source_cycle)
+      return {rvwmo::CheckStatus::Invalid, 0, "BOOM terminal facts differ from the actual source edge"};
+    return {};
+  } catch (const std::exception &error) {
     return {rvwmo::CheckStatus::Invalid, 0, error.what()};
   }
 }
