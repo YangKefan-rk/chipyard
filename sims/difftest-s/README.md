@@ -32,3 +32,33 @@ The scoped firtool launcher removes only annotations duplicated verbatim in
 both CHIRRTL and its sidecar JSON. The wrapper excludes the unrelated Radiance
 make fragment from these Rocket/BOOM profiles; the ordinary Chipyard build
 keeps its default generator fragments.
+
+## BOOM session embedding
+
+The first online scope starts from an independently initialized DRAM entry. Its
+entry program must initialize each GPR before reading it, except a0=mhartid from
+the native ROM. The reference image is loaded from the ELF's PT_LOAD segments;
+DUT RAM and observed store data never initialize the reference. Boot CSR, MMIO
+and trap activity is retained as explicitly uncovered bootstrap statistics.
+The native Small BOOM V4 profile uses ROB32, LDQ8 and STQ8.
+
+Build the complete session with `DIFFTEST_S_SESSION=1`, a Difftest-S revision
+containing the BOOM native collector and HostSession, `DIFFTEST_S_SPIKE_HOME`,
+and `DIFFTEST_S_SPIKE_LIBRARY` pointing to the matching BOOM pure C API library.
+Build that library with Spike's `PURE_API=1 MULTICORE_DIFF=1 EXTERNAL_MEMORY=1`
+target. An ordinary Spike library exports HTIF internals that can intercept the
+native simulator's loader; its C++ symbols must remain isolated. The native
+wrapper uses BFD by default (`DIFFTEST_S_LINKER=bfd`) for the verified toolchain.
+A local mold build dropped weak standard-library lookup data in the combined
+executable; it is not a validated linker for this profile.
+
+Set `DIFFTEST_S_ELF` to the same ELF supplied to the native harness. Optional
+`DIFFTEST_S_RAM_BASE` and `DIFFTEST_S_RAM_SIZE` configure independent reference
+RAM (decimal or 0x notation, at most 4 GiB). The sink installs before source
+sampling, drives the public HostSession and forwards actual independent REF
+store audits to the private adapter's bookkeeping. Native main returns nonzero
+unless both ingress and its installed final checker complete successfully.
+
+Current online execution verifies scalar prefixes but still returns Incomplete
+for missing hardware order or terminal drain evidence. No hart completion is
+inferred from a park loop, WFI, elapsed cycles or a correct memory signature.

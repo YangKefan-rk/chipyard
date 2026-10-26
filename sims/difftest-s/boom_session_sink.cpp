@@ -1,0 +1,189 @@
+#include "boom_native_source.h"
+#include "rvwmo/host_session.h"
+#include "rvwmo/dependency.h"
+#include "rvwmo/memory_image.h"
+#include "rvwmo/producer_ids.h"
+#include <verilated.h>
+#include <charconv>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+namespace difftest_s::native {
+namespace {
+using rvwmo::CheckResult;
+using rvwmo::CheckStatus;
+
+uint64_t configured_number(const char *name, uint64_t fallback) {
+  const char *text = std::getenv(name);
+  if (!text || !*text)
+    return fallback;
+  const std::string value(text);
+  const bool hexadecimal = value.size() > 2 && value.substr(0, 2) == "0x";
+  const char *begin = value.data() + (hexadecimal ? 2 : 0);
+  uint64_t number = 0;
+  const auto parsed = std::from_chars(begin, value.data() + value.size(), number, hexadecimal ? 16 : 10);
+  if (parsed.ec != std::errc() || parsed.ptr != value.data() + value.size())
+    throw std::invalid_argument(std::string("invalid native simulation setting ") + name);
+  return number;
+}
+
+class BoomSessionSink {
+public:
+  explicit BoomSessionSink(const char *elf) {
+    const auto *layout = find_native_layout(2, 0);
+    if (!layout)
+      throw std::invalid_argument("BOOM Runtime sink requires matching generated native layouts");
+    const uint64_t ram_base = configured_number("DIFFTEST_S_RAM_BASE", UINT64_C(0x80000000));
+    const uint64_t ram_size = configured_number("DIFFTEST_S_RAM_SIZE", UINT64_C(0x10000000));
+    if (!ram_size || ram_size > UINT64_C(0x100000000) || !memory_.initialize(ram_base, ram_size))
+      throw std::invalid_argument("BOOM Runtime sink requires bounded initialized independent RAM");
+    uint64_t entry = 0;
+    auto loaded = rvwmo::load_reference_elf(memory_, elf, entry);
+    if (!loaded)
+      throw std::invalid_argument("independent reference ELF: " + loaded.message);
+
+    BoomNativeSourceConfiguration source_config;
+    source_config.entry_pcs.assign(layout->harts, entry);
+    // Exact native Small BOOM V4 profile: ROB32/LDQ8/STQ8. Other configurations
+    // require their real capacity metadata rather than the adapter maximums.
+    source_config.limits.rob_slots = 32;
+    source_config.limits.ldq_slots = 8;
+    source_config.limits.stq_slots = 8;
+    source_ = std::make_unique<BoomNativeSource>(std::move(source_config));
+
+    rvwmo::HostSessionConfiguration config;
+    config.platform = "boom";
+    config.verification_scope =
+        "initialized DRAM-entry scalar RAM; boot ROM, bootstrap CSR/MMIO/traps are uncovered";
+    config.reference_profile = DIFFTEST_REF_PROFILE_ID_BOOM;
+    config.initial_harts.resize(layout->harts);
+    initialized_registers_.resize(layout->harts);
+    const std::vector<rvwmo::RuntimeEventKind> hart_kinds = {
+      rvwmo::RuntimeEventKind::InstructionAllocate, rvwmo::RuntimeEventKind::InstructionRetire,
+      rvwmo::RuntimeEventKind::InstructionCancelAttempt, rvwmo::RuntimeEventKind::InstructionSquash,
+      rvwmo::RuntimeEventKind::LocalStore, rvwmo::RuntimeEventKind::LoadSample};
+    for (uint32_t hart = 0; hart < layout->harts; ++hart) {
+      auto &initial = config.initial_harts[hart];
+      initial.pc = entry;
+      initial.privilege = 3;
+      // This explicit test profile requires an entry program whose only GPR
+      // read before initialization is a0, set by the native ROM's mhartid read.
+      initial.gpr[10] = hart;
+      initialized_registers_[hart][0] = true;
+      initialized_registers_[hart][10] = true;
+      const auto producer = rvwmo::hart_producer_id(hart);
+      config.stream.required_producers.push_back({producer, hart_kinds});
+      config.producers.push_back({producer, true, true, true, hart_kinds});
+      const auto fabric = rvwmo::memory_fabric_producer_id(hart);
+      config.stream.required_producers.push_back({fabric, {rvwmo::RuntimeEventKind::StorePublish}});
+      config.producers.push_back({fabric, true, true, true, {rvwmo::RuntimeEventKind::StorePublish}});
+    }
+    config.reference_store_observer = [this](const rvwmo::ReferenceStoreValue &store) {
+      return source_->audit_reference_store(store);
+    };
+    session_ = std::make_unique<rvwmo::HostSession>(memory_, std::move(config));
+    if (!session_->configuration())
+      throw std::invalid_argument("BOOM Runtime session: " + session_->configuration().message);
+  }
+
+  CheckResult capture(const NativeFrame &frame) {
+    if (!failure_)
+      return failure_;
+    auto result = source_->capture(frame);
+    if (frame.reset)
+      return result;
+    cycle_ = frame.source_cycle;
+    if (result) {
+      rvwmo::boom::CollectedObservations ready;
+      result = source_->take_ready(ready);
+      if (result)
+        result = validate_entry_registers(ready.retirements);
+      if (result)
+        result = session_->submit(ready.batch, ready.retirements).check;
+    }
+    if (!result && result.status != CheckStatus::Pending) {
+      failure_ = result;
+      session_->report_source_failure(result);
+      std::fprintf(stderr, "DIFFTEST-S BOOM source cycle %llu: status %u rule %u: %s\n",
+                   static_cast<unsigned long long>(cycle_), static_cast<unsigned>(result.status),
+                   result.rule, result.message.c_str());
+      // Return to the native main loop so its SV final processes run and emit a
+      // terminal checker report. The runner must reject every non-Pass report.
+      Verilated::gotFinish(true);
+    }
+    return result;
+  }
+
+  void transport_failed(const CheckResult &result) {
+    failure_ = result;
+    session_->report_source_failure(result);
+    Verilated::gotFinish(true);
+  }
+
+  CheckResult finalize() {
+    for (uint32_t hart = 0; hart < source_->unchecked_bootstrap().size(); ++hart) {
+      const auto &outside = source_->unchecked_bootstrap()[hart];
+      std::fprintf(stderr,
+        "DIFFTEST-S uncovered bootstrap hart %u: instructions=%llu loads=%llu stores=%llu traps=%llu\n",
+        hart, static_cast<unsigned long long>(outside.instructions), static_cast<unsigned long long>(outside.loads),
+        static_cast<unsigned long long>(outside.stores), static_cast<unsigned long long>(outside.traps));
+    }
+    // No completion is inferred from PC loops, elapsed cycles or RAM signatures.
+    // Missing architectural completion and physical drain remain Incomplete.
+    auto result = session_->finalize(cycle_);
+    std::fprintf(stderr, "DIFFTEST_S_FINAL %s\n", session_->final_report().c_str());
+    return failure_ ? result : failure_;
+  }
+
+private:
+  GlobalMem memory_;
+  std::unique_ptr<BoomNativeSource> source_;
+  std::unique_ptr<rvwmo::HostSession> session_;
+  uint64_t cycle_ = 0;
+  CheckResult failure_;
+  std::vector<std::array<bool, 32>> initialized_registers_;
+
+  CheckResult validate_entry_registers(const std::vector<rvwmo::ArchitecturalRetirement> &retirements) {
+    for (const auto &retirement : retirements) {
+      if (retirement.id.hart >= initialized_registers_.size())
+        return {CheckStatus::Invalid, 0, "entry-state validation names an unknown hart"};
+      rvwmo::DependencyMetadata dependencies;
+      auto result = rvwmo::decode_dependencies(retirement.instruction, dependencies);
+      if (!result)
+        return result;
+      auto &initialized = initialized_registers_[retirement.id.hart];
+      for (const auto reg : dependencies.sources)
+        if (reg >= initialized.size() || !initialized[reg])
+          return {CheckStatus::Unsupported, 0, "entry program reads a register outside its independently initialized state"};
+      for (const auto reg : dependencies.destinations)
+        if (reg < initialized.size())
+          initialized[reg] = true;
+    }
+    return {};
+  }
+};
+
+struct InstallBoomSession {
+  InstallBoomSession() {
+    const char *elf = std::getenv("DIFFTEST_S_ELF");
+    if (!elf || !*elf)
+      return;
+    try {
+      auto sink = std::make_shared<BoomSessionSink>(elf);
+      if (!register_native_consumer([sink](const NativeFrame &frame) { return sink->capture(frame); },
+                                    [sink] { return sink->finalize(); },
+                                    [sink](const CheckResult &failure) { sink->transport_failed(failure); }))
+        throw std::runtime_error("native Runtime sink was registered more than once or after sampling started");
+    } catch (const std::exception &error) {
+      std::fprintf(stderr, "DIFFTEST-S BOOM Runtime initialization failed: %s\n", error.what());
+      std::abort();
+    }
+  }
+};
+InstallBoomSession install;
+} // namespace
+} // namespace difftest_s::native

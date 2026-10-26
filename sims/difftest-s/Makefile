@@ -16,7 +16,35 @@ difftest_s_registry = $(build_dir)/difftest-s-native-layouts.cpp
 EXTRA_SIM_REQS += $(difftest_s_registry)
 EXTRA_SIM_SOURCES += $(difftest_s_bridge_dir)/native_probe.cpp $(difftest_s_registry)
 EXTRA_SIM_CXXFLAGS += -I$(difftest_s_bridge_dir) -I$(abspath $(DIFFTEST_S_DIR))/src/test/csrc/difftest
-EXTRA_SIM_LDFLAGS += -pthread
+# BFD preserves weak standard-library COMDAT data when the isolated reference
+# library and native HTIF are linked together in the supported toolchain.
+DIFFTEST_S_LINKER ?= bfd
+EXTRA_SIM_LDFLAGS += -pthread -fuse-ld=$(DIFFTEST_S_LINKER)
+
+# Native capture can run alone for diagnostics. The session build adds the
+# matched pure Spike C API library and compiles one Difftest-S C++ cohort.
+DIFFTEST_S_SESSION ?= 0
+ifeq ($(DIFFTEST_S_SESSION),1)
+ifneq ($(DIFFTEST_S_DUT),boom)
+$(error The native Runtime sink currently requires DIFFTEST_S_DUT=boom)
+endif
+ifeq ($(strip $(DIFFTEST_S_SPIKE_HOME)),)
+$(error DIFFTEST_S_SPIKE_HOME must name the matching Spike API checkout)
+endif
+ifeq ($(strip $(DIFFTEST_S_SPIKE_LIBRARY)),)
+$(error DIFFTEST_S_SPIKE_LIBRARY must name the built matching pure Spike API library)
+endif
+difftest_s_host_dir := $(abspath $(DIFFTEST_S_DIR))/src/test/csrc/difftest
+# The native simulator's old -lriscv must not satisfy versioned reference API
+# symbols before the selected profile library. Native HTIF still uses libfesvr.
+override LRISCV :=
+EXTRA_SIM_SOURCES += $(difftest_s_bridge_dir)/boom_native_decoder.cpp $(difftest_s_bridge_dir)/boom_native_source.cpp $(difftest_s_bridge_dir)/boom_session_sink.cpp
+EXTRA_SIM_SOURCES += $(difftest_s_host_dir)/globalmem_storage.cpp
+EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_host_dir)/rvwmo/,$(addsuffix .cpp,host_session memory_image spike_reference_pool spike_reference_stepper session stream checker_event_consumer checker memory ppo dependency lrsc))
+EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_host_dir)/adapters/boom/,$(addsuffix .cpp,native_collector retirement_snapshot word_bytes boom_event_adapter))
+EXTRA_SIM_CXXFLAGS += -I$(abspath $(DIFFTEST_S_SPIKE_HOME))
+EXTRA_SIM_LDFLAGS += $(abspath $(DIFFTEST_S_SPIKE_LIBRARY)) -Wl,-rpath,$(abspath $(dir $(DIFFTEST_S_SPIKE_LIBRARY)))
+endif
 
 # Chisel 6 may emit the same annotation in both CHIRRTL and the sidecar JSON.
 # The scoped launcher preserves all annotations while removing exact duplicates.
@@ -29,6 +57,11 @@ FIRTOOL_BIN ?= $(difftest_s_bridge_dir)/run_firtool.py
 GENERATOR_MAKE_FRAGMENTS = $(filter-out $(base_dir)/generators/radiance/chipyard.mk,$(wildcard $(base_dir)/generators/*/chipyard.mk))
 
 include $(difftest_s_bridge_dir)/../verilator/Makefile
+
+# The native default main always returns zero. Keep its time loop but use the
+# ingress/Runtime terminal status for the process exit code.
+override VERILATOR := verilator --timing --cc --exe
+EXTRA_SIM_SOURCES += $(difftest_s_bridge_dir)/verilator_main.cpp
 
 DIFFTEST_S_LAYOUTS = $(wildcard $(build_dir)/$(long_name).difftest-s-layout-*.json)
 $(difftest_s_registry): $(FIRRTL_FILE) $(difftest_s_bridge_dir)/generate_layout_registry.py

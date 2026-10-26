@@ -43,11 +43,18 @@ struct NativeFrame {
 
 using NativeFrameConsumer = std::function<rvwmo::CheckResult(const NativeFrame &)>;
 using NativeFinalizer = std::function<rvwmo::CheckResult()>;
+using NativeFailureObserver = std::function<void(const rvwmo::CheckResult &)>;
 
 // Install before the first source edge. The registered callbacks own Runtime
 // semantics; this ingress validates and frames native snapshots only.
-bool register_native_consumer(NativeFrameConsumer consume, NativeFinalizer finish);
+// The optional failure observer may stop the simulator and latch the error in
+// its checker session. It must not reenter this ingress while being notified.
+bool register_native_consumer(NativeFrameConsumer consume, NativeFinalizer finish,
+                              NativeFailureObserver failure = {});
 const NativeProbeLayout *find_native_layout(uint32_t kind, uint32_t hart);
+// Native mains use a nonzero exit status unless ingress and its registered
+// Runtime finalizer both completed successfully. Capture alone is Incomplete.
+int native_exit_status();
 
 } // namespace difftest_s::native
 #endif

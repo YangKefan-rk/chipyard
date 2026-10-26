@@ -36,12 +36,13 @@ std::string json_string(const std::string &value) {
 
 class NativeIngress {
 public:
-  bool install(NativeFrameConsumer consume, NativeFinalizer finish) {
+  bool install(NativeFrameConsumer consume, NativeFinalizer finish, NativeFailureObserver failure) {
     std::lock_guard<std::mutex> guard(lock_);
     if (started_ || consume_ || !consume || !finish)
       return false;
     consume_ = std::move(consume);
     finish_ = std::move(finish);
+    failure_observer_ = std::move(failure);
     return true;
   }
 
@@ -103,6 +104,11 @@ public:
     drain();
   }
 
+  int exit_status() {
+    std::lock_guard<std::mutex> guard(lock_);
+    return finished_ && failure_ ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
+
   void finalize() {
     std::lock_guard<std::mutex> guard(lock_);
     if (finished_)
@@ -139,6 +145,7 @@ private:
   std::mutex lock_;
   NativeFrameConsumer consume_;
   NativeFinalizer finish_;
+  NativeFailureObserver failure_observer_;
   std::map<uint64_t, NativeFrame> pending_;
   std::map<uint32_t, uint64_t> last_tick_;
   std::ofstream trace_;
@@ -154,8 +161,18 @@ private:
   bool left_reset_ = false;
 
   void fail(rvwmo::CheckStatus status, const std::string &message) {
-    if (failure_)
-      failure_ = {status, 0, message};
+    if (!failure_)
+      return;
+    failure_ = {status, 0, message};
+    if (failure_observer_) {
+      try {
+        failure_observer_(failure_);
+      } catch (const std::exception &error) {
+        std::fprintf(stderr, "DIFFTEST-S native failure observer threw: %s\n", error.what());
+      } catch (...) {
+        std::fprintf(stderr, "DIFFTEST-S native failure observer threw an unknown exception\n");
+      }
+    }
   }
 
   void trace(const NativeFrame &frame) {
@@ -224,8 +241,12 @@ NativeIngress &ingress() {
 }
 } // namespace
 
-bool register_native_consumer(NativeFrameConsumer consume, NativeFinalizer finish) {
-  return ingress().install(std::move(consume), std::move(finish));
+bool register_native_consumer(NativeFrameConsumer consume, NativeFinalizer finish, NativeFailureObserver failure) {
+  return ingress().install(std::move(consume), std::move(finish), std::move(failure));
+}
+
+int native_exit_status() {
+  return ingress().exit_status();
 }
 } // namespace difftest_s::native
 
