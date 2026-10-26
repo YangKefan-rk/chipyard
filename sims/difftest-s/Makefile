@@ -19,7 +19,7 @@ EXTRA_SIM_CXXFLAGS += -I$(difftest_s_bridge_dir) -I$(abspath $(DIFFTEST_S_DIR))/
 # BFD preserves weak standard-library COMDAT data when the isolated reference
 # library and native HTIF are linked together in the supported toolchain.
 DIFFTEST_S_LINKER ?= bfd
-EXTRA_SIM_LDFLAGS += -pthread -fuse-ld=$(DIFFTEST_S_LINKER)
+override EXTRA_SIM_LDFLAGS += -pthread -fuse-ld=$(DIFFTEST_S_LINKER)
 
 # Native capture can run alone for diagnostics. The session build adds the
 # matched pure Spike C API library and compiles one Difftest-S C++ cohort.
@@ -47,7 +47,7 @@ EXTRA_SIM_SOURCES += $(difftest_s_host_dir)/globalmem_storage.cpp
 EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_host_dir)/rvwmo/,$(addsuffix .cpp,host_session memory_image spike_reference_pool spike_reference_stepper session stream checker_event_consumer checker memory ppo dependency lrsc))
 EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_host_dir)/adapters/$(DIFFTEST_S_DUT)/,$(addsuffix .cpp,$(difftest_s_adapter_sources)))
 EXTRA_SIM_CXXFLAGS += -I$(abspath $(DIFFTEST_S_SPIKE_HOME))
-EXTRA_SIM_LDFLAGS += $(abspath $(DIFFTEST_S_SPIKE_LIBRARY)) -Wl,-rpath,$(abspath $(dir $(DIFFTEST_S_SPIKE_LIBRARY)))
+override EXTRA_SIM_LDFLAGS += $(abspath $(DIFFTEST_S_SPIKE_LIBRARY)) -Wl,-rpath,$(abspath $(dir $(DIFFTEST_S_SPIKE_LIBRARY)))
 endif
 
 # Chisel 6 may emit the same annotation in both CHIRRTL and the sidecar JSON.
