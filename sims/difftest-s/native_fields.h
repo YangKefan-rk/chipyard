@@ -75,8 +75,12 @@ public:
       const auto number = path.substr(prefix.size(), path.size() - prefix.size() - suffix.size());
       unsigned index = 0;
       const auto parsed = std::from_chars(number.data(), number.data() + number.size(), index);
+      std::string record_name(group);
+      record_name.push_back('[');
+      record_name += std::to_string(index);
+      record_name.push_back(']');
       if (parsed.ec != std::errc() || parsed.ptr != number.data() + number.size() || index >= 256 ||
-          !indexed.emplace(index, std::string(group) + '[' + std::to_string(index) + ']').second)
+          !indexed.emplace(index, std::move(record_name)).second)
         throw std::invalid_argument("invalid native probe vector: " + std::string(group));
     }
     if (indexed.empty())
