@@ -11,6 +11,15 @@ namespace difftest_s::native {
 struct RocketDecoderConfiguration {
   size_t capacity = 65536;
   uint32_t publication_producer = 0;
+  // Zero checks the whole source. A nonzero entry explicitly excludes bootstrap.
+  uint64_t entry_pc = 0;
+};
+
+struct RocketBootstrapCounts {
+  uint64_t instructions = 0;
+  uint64_t loads = 0;
+  uint64_t stores = 0;
+  uint64_t traps = 0;
 };
 
 struct RocketDecodedFrame {
@@ -21,6 +30,7 @@ struct RocketDecodedFrame {
   // prefix from every participating decoder. This is not a physical-idle proof.
   std::optional<uint64_t> publication_closed_through;
   bool tracked_work_drained = false;
+  std::optional<bool> physically_idle;
 };
 
 // Allocates a unique fabric source identity at the observed drain edge. The
@@ -40,6 +50,7 @@ public:
 
   rvwmo::CheckResult decode(const NativeFrame &source, RocketDecodedFrame &output);
   rvwmo::CheckResult finalize() const;
+  const RocketBootstrapCounts &unchecked_bootstrap() const;
 
 private:
   struct State;

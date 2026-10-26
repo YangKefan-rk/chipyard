@@ -1,11 +1,8 @@
 #include "rocket_native_decoder.h"
 #include "native_fields.h"
-#include "adapters/rocket/cache_tracker.h"
-#include "adapters/rocket/retirement_capture.h"
+#include "adapters/rocket/native_adapter.h"
 #include "rvwmo/producer_ids.h"
 #include <algorithm>
-#include <deque>
-#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -88,6 +85,7 @@ struct StoreFields : ValidFields {
 struct Fields {
   NativeFields metadata;
   NativeField hart, core_requestor, cache_requestors, cache_available;
+  std::optional<NativeField> cache_idle;
   ValidFields allocate, core_request, cache_request, s1_rejected, result, load, drain, retire, late_write, trap;
   InstructionFields allocation, retirement;
   AccessFields core_access, cache_access, result_access, load_access;
@@ -129,7 +127,14 @@ struct Fields {
         late_destination(metadata.field("core.lateWrite.bits.destination")), late_data(metadata.field("core.lateWrite.bits.data")),
         execute_killed(metadata.field("core.executeKilled.valid")), execute_token(metadata.field("core.executeKilled.bits")),
         memory_killed(metadata.field("core.memoryKilled.valid")), memory_token(metadata.field("core.memoryKilled.bits")),
-        wb_rejected(metadata.field("core.writebackRejected.valid")), wb_token(metadata.field("core.writebackRejected.bits")) {}
+        wb_rejected(metadata.field("core.writebackRejected.valid")), wb_token(metadata.field("core.writebackRejected.bits")) {
+    for (size_t index = 0; index < layout.field_count; ++index)
+      if (std::string_view(layout.fields[index].path) == "cache.idle") {
+        cache_idle = metadata.field("cache.idle");
+        if (cache_idle->width != 1)
+          throw std::invalid_argument("Rocket physical cache-idle proof must have one bit");
+      }
+  }
 };
 } // namespace
 
@@ -139,9 +144,7 @@ struct RocketNativeDecoder::State {
     rvwmo::OperationId id;
     uint32_t next_attempt = 0;
     std::optional<uint64_t> request;
-    std::optional<rocket::NativeRetirement> retirement;
-    std::optional<SourcePosition> local_source;
-    bool local_committed = false;
+    bool retired = false;
     bool emitted = false;
     bool snapshot_delivered = false;
     bool unsupported_memory = false;
@@ -150,26 +153,23 @@ struct RocketNativeDecoder::State {
     rocket::RequestDetails details;
     std::optional<uint64_t> token;
     bool result_seen = false;
-  };
-  struct Publication {
-    rocket::CacheStoreValue value;
-    uint64_t token = 0;
+    bool qualified_store = false;
+    bool discarded = false;
   };
 
   const NativeProbeLayout *layout;
   RocketDecoderConfiguration configuration;
   RocketPublicationSource publication_source;
   Fields fields;
-  std::unique_ptr<rocket::CacheTracker> tracker;
-  std::unique_ptr<rocket::EventEmitter> emitter;
-  std::unique_ptr<rocket::RetirementCapture> capture;
+  std::unique_ptr<rocket::NativeAdapter> adapter;
   std::map<uint64_t, Instruction> instructions;
   std::map<uint64_t, uint64_t> uid_tokens;
   std::map<uint64_t, Request> requests;
-  std::deque<Publication> publications;
-  std::optional<uint64_t> last_transport_tick, last_cycle, last_request, last_closed;
-  uint64_t epoch = 0;
-  uint64_t next_sequence = 1;
+  std::map<uint64_t, SourcePosition> publications;
+  std::optional<uint64_t> last_transport_tick, last_cycle, last_request, last_closed, entry_token;
+  RocketBootstrapCounts bootstrap;
+  RocketDecodedFrame *output = nullptr;
+  uint64_t epoch = 0, next_sequence = 1, next_uid = 1;
   uint32_t core_requestor = 0, requestors = 0;
   CheckResult failure;
   bool started = false;
@@ -194,12 +194,12 @@ struct RocketNativeDecoder::State {
   }
 
   void require(CheckResult result) {
-    if (result)
-      return;
-    if (result.status == CheckStatus::Pending)
-      result = {CheckStatus::Incomplete, 0, "Rocket native capture cannot retain this source edge: " + result.message};
-    failure = std::move(result);
-    throw failure;
+    if (!result && result.status != CheckStatus::Pending)
+      throw result;
+  }
+
+  bool in_scope(uint64_t token) const {
+    return !configuration.entry_pc || (entry_token && token >= *entry_token);
   }
 
   Instruction &instruction(uint64_t token) {
@@ -212,8 +212,62 @@ struct RocketNativeDecoder::State {
   Request &request(uint64_t id) {
     auto found = requests.find(id);
     if (found == requests.end())
-      throw std::invalid_argument("Rocket native cache fact has no live request identity");
+      throw std::invalid_argument("Rocket native cache fact has no live request identity: hart=" +
+          std::to_string(layout->hart) + " request=" + std::to_string(id));
     return found->second;
+  }
+
+  void collect_output() {
+    while (const auto *ready = adapter->output()) {
+      if (!output)
+        throw std::invalid_argument("Rocket native output has no staging owner");
+      for (const auto &event : ready->batch.events) {
+        if (event.kind == rvwmo::RuntimeEventKind::InstructionRetire) {
+          const auto &retired = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction;
+          auto &live = instruction(uid_tokens.at(retired.uid));
+          live.emitted = true;
+          if (live.request && !(live.allocation.memory && live.allocation.memory_command == 1)) {
+            requests.erase(*live.request);
+            live.request.reset();
+          }
+        } else if (event.kind == rvwmo::RuntimeEventKind::StorePublish) {
+          const auto &published = std::get<rvwmo::StorePublishEvent>(event.payload);
+          if (published.members.size() != 1)
+            throw std::invalid_argument("Rocket ordinary publication has unexpected merged members");
+          auto &live = instruction(uid_tokens.at(published.members.front().id.uid));
+          if (!live.request || !publications.erase(*live.request))
+            throw std::invalid_argument("Rocket publication has no retained physical drain");
+          requests.erase(*live.request);
+          live.request.reset();
+        }
+        output->batch.events.push_back(event);
+      }
+      output->batch.watermarks.insert(output->batch.watermarks.end(), ready->batch.watermarks.begin(),
+                                      ready->batch.watermarks.end());
+      for (const auto &snapshot : ready->retirements) {
+        instruction(uid_tokens.at(snapshot.id.uid)).snapshot_delivered = true;
+        output->retirements.push_back(snapshot);
+      }
+      const auto serial = ready->serial;
+      // The prior serial is consumed even when polling the next join is Pending.
+      require(adapter->acknowledge_output(serial));
+      for (auto live = instructions.begin(); live != instructions.end();) {
+        if (live->second.emitted && live->second.snapshot_delivered && !live->second.request) {
+          uid_tokens.erase(live->second.id.uid);
+          live = instructions.erase(live);
+        } else {
+          ++live;
+        }
+      }
+    }
+  }
+
+  void capture(rocket::CaptureResult result) {
+    require(result.check);
+    if (!result.consumed)
+      throw CheckResult{CheckStatus::Incomplete, result.check.rule,
+                       "Rocket native source cannot stall an unconsumed input: " + result.check.message};
+    collect_output();
   }
 
   void initialize(const Sample &sample, uint64_t observed_epoch) {
@@ -222,11 +276,11 @@ struct RocketNativeDecoder::State {
     if (!requestors || requestors > 1024 || core_requestor >= requestors || !observed_epoch)
       throw std::invalid_argument("Rocket native requestor metadata or epoch is invalid");
     epoch = observed_epoch;
-    tracker = std::make_unique<rocket::CacheTracker>(rocket::CacheConfiguration{core_requestor, requestors, configuration.capacity});
-    emitter = std::make_unique<rocket::EventEmitter>(rocket::EmitterConfiguration{
-        layout->hart, rvwmo::hart_producer_id(layout->hart), epoch, configuration.capacity, 64,
-        configuration.publication_producer});
-    capture = std::make_unique<rocket::RetirementCapture>(rocket::RetirementConfiguration{layout->hart, epoch, configuration.capacity});
+    rocket::NativeConfiguration config;
+    config.emitter = {layout->hart, rvwmo::hart_producer_id(layout->hart), epoch,
+                      configuration.capacity, 64, configuration.publication_producer};
+    config.cache = {core_requestor, requestors, configuration.capacity};
+    adapter = std::make_unique<rocket::NativeAdapter>(config);
     started = true;
   }
 
@@ -234,18 +288,19 @@ struct RocketNativeDecoder::State {
     if (!fields.allocate.valid.read(sample))
       return;
     auto allocation = fields.allocation.read(sample, source(cycle));
-    rvwmo::OperationId id;
-    require(emitter->begin(allocation, id));
-    require(capture->allocate(allocation, id));
-    if (instructions.size() >= configuration.capacity)
+    if (!entry_token && configuration.entry_pc == allocation.pc)
+      entry_token = allocation.token;
+    if (!in_scope(allocation.token))
+      return;
+    if (instructions.size() >= configuration.capacity || !next_uid)
       throw CheckResult{CheckStatus::Incomplete, 0, "Rocket native instruction table capacity exhausted"};
-    if (instructions.count(allocation.token))
+    Instruction live;
+    live.allocation = allocation;
+    live.id = {layout->hart, epoch, next_uid++, 0};
+    if (!instructions.emplace(allocation.token, live).second)
       throw std::invalid_argument("Rocket native instruction token was allocated twice");
-    Instruction state;
-    state.allocation = allocation;
-    state.id = id;
-    instructions.emplace(allocation.token, std::move(state));
-    uid_tokens.emplace(id.uid, allocation.token);
+    uid_tokens.emplace(live.id.uid, allocation.token);
+    capture(adapter->allocate(allocation));
   }
 
   void bind(const Sample &sample, uint64_t cycle) {
@@ -268,33 +323,37 @@ struct RocketNativeDecoder::State {
     const bool belongs_to_core = (details.tag & mask) == core_requestor;
     if (belongs_to_core != core_valid)
       throw std::invalid_argument("Rocket cache requestor tag disagrees with the native core handshake");
-    Request association{details, std::nullopt, false};
+    Request association{details, std::nullopt, false, false, false};
     if (belongs_to_core) {
       const uint64_t token = fields.core_access.id.read(sample);
-      auto &live = instruction(token);
-      if (live.request)
-        throw std::invalid_argument("Rocket native instruction has more than one uncancelled cache request");
-      const auto position = source(cycle);
-      const rocket::CoreRequest core{token, live.next_attempt, fields.core_access.read(sample), position};
-      const rocket::CacheRequest cache{id, details, position, static_cast<bool>(fields.array_read.read(sample))};
-      require(tracker->bind(core, cache));
-      live.request = id;
-      association.token = token;
+      if (in_scope(token)) {
+        auto &live = instruction(token);
+        if (live.request)
+          throw std::invalid_argument("Rocket native instruction has more than one uncancelled cache request");
+        const auto position = source(cycle);
+        const rocket::CoreRequest core{token, live.next_attempt, fields.core_access.read(sample), position};
+        const rocket::CacheRequest cache{id, details, position, static_cast<bool>(fields.array_read.read(sample))};
+        live.request = id;
+        association.token = token;
+        requests.emplace(id, association);
+        capture(adapter->bind_request(core, cache));
+        return;
+      }
     }
-    requests.emplace(id, std::move(association));
+    requests.emplace(id, association);
   }
 
   void release(uint64_t id, bool cancelled) {
     auto &association = request(id);
     if (association.token) {
-      auto &live = instruction(*association.token);
-      if (cancelled && association.details.command == 0) {
-        require(emitter->cancel_load(*association.token, live.next_attempt));
-        if (live.next_attempt == UINT32_MAX)
-          throw std::invalid_argument("Rocket native load attempt exhausted");
-        ++live.next_attempt;
-      }
-      require(tracker->release(id));
+      const uint64_t token = *association.token;
+      if (!cancelled)
+        throw std::invalid_argument("Rocket native release requires an observed cancellation");
+      auto &live = instruction(token);
+      capture(adapter->cancel_request(id));
+      if (live.next_attempt == UINT32_MAX)
+        throw std::invalid_argument("Rocket native load attempt exhausted");
+      ++live.next_attempt;
       live.request.reset();
     }
     requests.erase(id);
@@ -311,13 +370,16 @@ struct RocketNativeDecoder::State {
           association.details.size != details.size || association.details.tag != details.tag)
         throw std::invalid_argument("Rocket native cache result is duplicated or changed request metadata");
       association.result_seen = true;
+      association.qualified_store = fields.hit.read(sample) && fields.cached.read(sample) &&
+          !fields.killed.read(sample) && !fields.nacked.read(sample) && !fields.exception.read(sample);
       if (fields.killed.read(sample) || fields.nacked.read(sample) || fields.exception.read(sample)) {
         release(id, true);
       } else if (association.token && !fields.cached.read(sample)) {
         instruction(*association.token).unsupported_memory = true;
-      } else if (!association.token && association.details.command == 0 &&
-                 (!fields.load.valid.read(sample) || fields.load_access.id.read(sample) != id)) {
-        release(id, false);
+      } else if (!association.token &&
+                 (!fields.load.valid.read(sample) || fields.load_access.id.read(sample) != id) &&
+                 (!fields.accepted.valid.read(sample) || fields.accepted.id.read(sample) != id)) {
+        requests.erase(id);
       }
     }
     if (fields.load.valid.read(sample)) {
@@ -331,71 +393,84 @@ struct RocketNativeDecoder::State {
           details.tag != association.details.tag)
         throw std::invalid_argument("Rocket load sample changed its request metadata");
       if (association.token) {
-        rocket::LoadObservation load;
-        auto converted = tracker->load_sample({id, fields.load_access.address.read(sample), fields.load_data.read(sample)}, load);
-        if (converted.status != CheckStatus::Pending) {
-          require(converted);
-          require(emitter->sample_load(load));
-        }
-      }
-      // Non-core implicit reads carry no explicit architectural retirement.
-      if (!association.token)
+        capture(adapter->sample_load({id, fields.load_access.address.read(sample), fields.load_data.read(sample)}));
+      } else {
         requests.erase(id);
+      }
     }
     if (fields.accepted.valid.read(sample)) {
       const auto id = fields.accepted.id.read(sample);
       auto &association = request(id);
-      if (!association.token)
-        throw CheckResult{CheckStatus::Unsupported, 0, "Rocket implicit non-core stores need an observed translation-write protocol"};
-      if (!association.result_seen)
-        throw std::invalid_argument("Rocket store acceptance has no matching cache result");
-      auto converted = tracker->accept_store(fields.accepted.read(sample, source(cycle)));
-      if (converted.status != CheckStatus::Pending)
-        require(converted);
+      if (association.discarded)
+        throw CheckResult{CheckStatus::Violation, 0, "Rocket squashed store reached cache acceptance"};
+      if (!association.token) {
+        ++bootstrap.stores;
+        throw CheckResult{CheckStatus::Incomplete, 0,
+          "Rocket cached bootstrap or implicit store changes memory outside the independent entry-state contract"};
+      }
+      if (!association.qualified_store)
+        throw std::invalid_argument("Rocket store acceptance lacks a successful cached permission hit");
+      capture(adapter->accept_store(fields.accepted.read(sample, source(cycle))));
     }
     if (fields.merge.read(sample))
-      require(tracker->observe_merge());
+      throw CheckResult{CheckStatus::Unsupported, 0, "Rocket merged stores require complete per-byte writer membership"};
     if (fields.drain.valid.read(sample) && !fields.maintenance.read(sample)) {
       const auto id = fields.drain_id.read(sample);
       auto &association = request(id);
-      if (!association.token)
-        throw CheckResult{CheckStatus::Unsupported, 0, "Rocket non-core store drain has no architectural writer identity"};
+      if (!association.token || !association.qualified_store)
+        throw CheckResult{CheckStatus::Incomplete, 0, "Rocket physical drain has no qualified committed writer"};
       const auto position = publication_source(cycle);
       if (position.cycle != cycle || !position.producer_sequence ||
           position.qualified_phase == SourcePosition::cycle_closed_phase)
         throw std::invalid_argument("Rocket fabric source allocator changed the observed drain edge");
-      if (publications.size() >= configuration.capacity)
-        throw CheckResult{CheckStatus::Incomplete, 0, "Rocket native publication buffer exhausted"};
-      if (std::any_of(publications.begin(), publications.end(), [id](const auto &entry) { return entry.value.request_id == id; }))
+      if (!publications.emplace(id, position).second)
         throw std::invalid_argument("Rocket native store drain was observed twice");
-      publications.push_back({{id, fields.drain_address.read(sample), fields.drain_data.read(sample),
-                               narrow_byte(fields.drain_mask.read(sample)), position}, *association.token});
+      capture(adapter->publish({{id, fields.drain_address.read(sample), fields.drain_data.read(sample),
+                               narrow_byte(fields.drain_mask.read(sample)), position}, position.producer_sequence}));
     }
   }
 
   void squash(uint64_t token) {
-    if (std::any_of(publications.begin(), publications.end(), [token](const auto &entry) { return entry.token == token; }))
-      throw CheckResult{CheckStatus::Violation, 0, "Rocket squashed instruction already changed the cache data array"};
-    require(emitter->squash(token));
-    require(capture->squash(token));
+    if (!in_scope(token))
+      return;
     const auto found = instructions.find(token);
-    if (found == instructions.end())
-      return; // Both adapters certified a repeated native termination fact.
-    for (auto request = requests.begin(); request != requests.end();) {
-      if (request->second.token == token)
-        request = requests.erase(request);
-      else
-        ++request;
+    if (found != instructions.end()) {
+      if (found->second.request && publications.count(*found->second.request))
+        throw CheckResult{CheckStatus::Violation, 0, "Rocket squashed instruction already changed the cache data array"};
+      for (auto pending = requests.begin(); pending != requests.end();) {
+        if (pending->second.token != token) {
+          ++pending;
+          continue;
+        }
+        if (pending->second.result_seen) {
+          pending = requests.erase(pending);
+          continue;
+        }
+        // The physical S1/S2 rejection can arrive after the core kill. Keep
+        // its exact request identity until that terminal cache fact arrives.
+        pending->second.token.reset();
+        pending->second.discarded = true;
+        ++pending;
+      }
+      uid_tokens.erase(found->second.id.uid);
+      instructions.erase(found);
     }
-    tracker->discard_instruction(token);
-    uid_tokens.erase(found->second.id.uid);
-    instructions.erase(found);
+    capture(adapter->squash(token));
   }
 
   void retire(const Sample &sample, uint64_t cycle) {
     if (!fields.retire.valid.read(sample))
       return;
     const auto token = fields.retirement.token.read(sample);
+    if (!in_scope(token)) {
+      ++bootstrap.instructions;
+      if (fields.retire_memory.read(sample)) {
+        const auto command = fields.retire_command.read(sample);
+        bootstrap.loads += command == 0;
+        bootstrap.stores += command == 1;
+      }
+      return;
+    }
     auto &live = instruction(token);
     const auto observed = fields.retirement.read(sample, source(cycle));
     if (observed.memory != static_cast<bool>(fields.retire_memory.read(sample)) ||
@@ -403,84 +478,21 @@ struct RocketNativeDecoder::State {
         observed.memory != live.allocation.memory ||
         (observed.memory && observed.memory_command != live.allocation.memory_command))
       throw std::invalid_argument("Rocket native retirement decode qualifiers changed within one instruction");
-    if (live.retirement)
+    if (live.retired)
       throw std::invalid_argument("Rocket native retirement was observed twice");
     if (live.unsupported_memory)
       throw CheckResult{CheckStatus::Unsupported, 0, "Rocket retired an uncached or implicit memory access"};
-    if (observed.memory && observed.memory_command == 1)
-      live.local_source = observed.source;
     rocket::NativeRetirement retirement{token, observed.pc, observed.instruction, source(cycle),
         static_cast<bool>(fields.integer_write.read(sample)), static_cast<bool>(fields.deferred_write.read(sample)),
         narrow_byte(fields.destination.read(sample)), fields.write_data.read(sample),
         static_cast<bool>(fields.floating_point.read(sample))};
-    require(capture->retire(retirement));
-    live.retirement = retirement;
+    live.retired = true;
+    capture(adapter->retire({retirement, observed.source}));
   }
 
-  void emit_ready() {
-    for (auto &entry : instructions) {
-      auto &live = entry.second;
-      if (!live.retirement || live.emitted)
-        continue;
-      if (live.local_source && !live.local_committed) {
-        rocket::StoreObservation store;
-        auto local = tracker->local_store(entry.first, *live.local_source, store);
-        if (local.status == CheckStatus::Pending)
-          continue;
-        require(local);
-        require(emitter->commit_store(store));
-        live.local_committed = true;
-      }
-      auto retired = emitter->retire(entry.first, live.retirement->source);
-      if (retired.status == CheckStatus::Pending)
-        continue;
-      require(retired);
-      live.emitted = true;
-      if (live.request && !live.local_source)
-        release(*live.request, false);
-    }
-    for (auto publication = publications.begin(); publication != publications.end();) {
-      rocket::StoreObservation store;
-      auto converted = tracker->publication(publication->value, store);
-      if (converted.status == CheckStatus::Pending) {
-        ++publication;
-        continue;
-      }
-      require(converted);
-      auto published = emitter->publish_store(store, publication->value.source.producer_sequence);
-      if (published.status == CheckStatus::Pending) {
-        ++publication;
-        continue;
-      }
-      require(published);
-      release(publication->value.request_id, false);
-      publication = publications.erase(publication);
-    }
-  }
-
-  void capture_snapshots(RocketDecodedFrame &output) {
-    for (const auto &snapshot : capture->take_ready()) {
-      const auto token = uid_tokens.find(snapshot.id.uid);
-      if (token == uid_tokens.end())
-        throw std::invalid_argument("Rocket captured retirement has no logical native identity");
-      auto &live = instruction(token->second);
-      live.snapshot_delivered = true;
-      output.retirements.push_back({snapshot.id, snapshot.pc, snapshot.instruction,
-          snapshot.integer_write ? rvwmo::ArchitecturalDestination::Integer : rvwmo::ArchitecturalDestination::None,
-          snapshot.destination, snapshot.value});
-    }
-    for (auto live = instructions.begin(); live != instructions.end();) {
-      if (live->second.emitted && live->second.snapshot_delivered && !live->second.request) {
-        uid_tokens.erase(live->second.id.uid);
-        live = instructions.erase(live);
-      } else {
-        ++live;
-      }
-    }
-  }
-
-  void close_prefix(uint64_t cycle, RocketDecodedFrame &output) {
-    output.batch = emitter->take_batch();
+  void close_prefix(uint64_t cycle) {
+    require(adapter->poll());
+    collect_output();
     std::optional<uint64_t> earliest;
     for (const auto &entry : instructions)
       if (!entry.second.emitted)
@@ -489,26 +501,29 @@ struct RocketNativeDecoder::State {
     if (!earliest || *earliest != 0) {
       const auto complete = earliest ? std::min(cycle, *earliest - 1) : cycle;
       if (!last_closed || complete > *last_closed) {
-        require(emitter->close_through(complete));
-        auto closure = emitter->take_batch();
-        output.batch.watermarks = std::move(closure.watermarks);
+        auto closure = adapter->close_hart_prefix(complete);
+        if (!closure)
+          throw CheckResult{closure.status == CheckStatus::Pending ? CheckStatus::Incomplete : closure.status,
+                            closure.rule, closure.message};
+        collect_output();
         last_closed = complete;
       }
-      output.hart_closed_through = complete;
+      output->hart_closed_through = complete;
     }
     auto fabric = cycle;
     for (const auto &publication : publications) {
-      if (publication.value.source.cycle == 0) {
-        output.publication_closed_through.reset();
+      if (!publication.second.cycle) {
+        output->publication_closed_through.reset();
         return;
       }
-      fabric = std::min(fabric, publication.value.source.cycle - 1);
+      fabric = std::min(fabric, publication.second.cycle - 1);
     }
-    output.publication_closed_through = fabric;
-    output.tracked_work_drained = instructions.empty() && requests.empty() && publications.empty();
+    output->publication_closed_through = fabric;
+    output->tracked_work_drained = instructions.empty() && requests.empty() && publications.empty() &&
+                                   (!configuration.entry_pc || entry_token.has_value());
   }
 
-  CheckResult decode(const NativeFrame &frame, RocketDecodedFrame &output) {
+  CheckResult decode(const NativeFrame &frame, RocketDecodedFrame &converted) {
     if (!failure)
       return failure;
     try {
@@ -546,8 +561,13 @@ struct RocketNativeDecoder::State {
       if (fields.core_requestor.read(sample) != core_requestor || fields.cache_requestors.read(sample) != requestors)
         throw std::invalid_argument("Rocket native cache requestor roster changed");
       last_cycle = frame.source_cycle;
-      if (fields.trap.valid.read(sample))
-        throw CheckResult{CheckStatus::Unsupported, 0, "Rocket trap or interrupt requires the shared architectural trap protocol"};
+      RocketDecodedFrame staged;
+      output = &staged;
+      if (fields.trap.valid.read(sample)) {
+        if (!configuration.entry_pc || entry_token)
+          throw CheckResult{CheckStatus::Unsupported, 0, "Rocket trap or interrupt requires the shared architectural trap protocol"};
+        ++bootstrap.traps;
+      }
       allocate(sample, frame.source_cycle);
       bind(sample, frame.source_cycle);
       cache_results(sample, frame.source_cycle);
@@ -562,18 +582,20 @@ struct RocketNativeDecoder::State {
         if (token)
           squash(token);
       retire(sample, frame.source_cycle);
-      if (fields.late_write.valid.read(sample))
-        require(capture->late_write({fields.late_token.read(sample), static_cast<bool>(fields.late_known.read(sample)),
+      if (fields.late_write.valid.read(sample) && in_scope(fields.late_token.read(sample)))
+        capture(adapter->late_write({fields.late_token.read(sample), static_cast<bool>(fields.late_known.read(sample)),
             narrow_byte(fields.late_destination.read(sample)), fields.late_data.read(sample), source(frame.source_cycle)}));
-      emit_ready();
-      RocketDecodedFrame converted;
-      capture_snapshots(converted);
-      close_prefix(frame.source_cycle, converted);
-      output = std::move(converted);
+      close_prefix(frame.source_cycle);
+      if (fields.cache_idle)
+        staged.physically_idle = fields.cache_idle->read(sample);
+      output = nullptr;
+      converted = std::move(staged);
       return {};
     } catch (const CheckResult &error) {
+      output = nullptr;
       return remember(error);
-    } catch (const std::invalid_argument &error) {
+    } catch (const std::exception &error) {
+      output = nullptr;
       return remember({CheckStatus::Invalid, 0, error.what()});
     }
   }
@@ -591,14 +613,16 @@ CheckResult RocketNativeDecoder::decode(const NativeFrame &source, RocketDecoded
 CheckResult RocketNativeDecoder::finalize() const {
   if (!state_->failure)
     return state_->failure;
-  if (!state_->started)
-    return {CheckStatus::Incomplete, 0, "Rocket native source never left reset"};
-  for (const auto &result : {state_->emitter->finalize(), state_->capture->finalize(), state_->tracker->finalize()})
-    if (!result)
-      return {result.status == CheckStatus::Pending ? CheckStatus::Incomplete : result.status, result.rule, result.message};
+  if (!state_->started || (state_->configuration.entry_pc && !state_->entry_token))
+    return {CheckStatus::Incomplete, 0, "Rocket native hart never entered its checked scope"};
+  auto result = state_->adapter->finalize();
+  if (!result)
+    return {result.status == CheckStatus::Pending ? CheckStatus::Incomplete : result.status, result.rule, result.message};
   if (!state_->instructions.empty() || !state_->requests.empty() || !state_->publications.empty())
     return {CheckStatus::Incomplete, 0, "Rocket native decoder has undrained instruction or cache facts"};
   return {};
 }
+
+const RocketBootstrapCounts &RocketNativeDecoder::unchecked_bootstrap() const { return state_->bootstrap; }
 
 } // namespace difftest_s::native

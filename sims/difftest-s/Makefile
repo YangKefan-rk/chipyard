@@ -25,9 +25,6 @@ EXTRA_SIM_LDFLAGS += -pthread -fuse-ld=$(DIFFTEST_S_LINKER)
 # matched pure Spike C API library and compiles one Difftest-S C++ cohort.
 DIFFTEST_S_SESSION ?= 0
 ifeq ($(DIFFTEST_S_SESSION),1)
-ifneq ($(DIFFTEST_S_DUT),boom)
-$(error The native Runtime sink currently requires DIFFTEST_S_DUT=boom)
-endif
 ifeq ($(strip $(DIFFTEST_S_SPIKE_HOME)),)
 $(error DIFFTEST_S_SPIKE_HOME must name the matching Spike API checkout)
 endif
@@ -38,10 +35,17 @@ difftest_s_host_dir := $(abspath $(DIFFTEST_S_DIR))/src/test/csrc/difftest
 # The native simulator's old -lriscv must not satisfy versioned reference API
 # symbols before the selected profile library. Native HTIF still uses libfesvr.
 override LRISCV :=
-EXTRA_SIM_SOURCES += $(difftest_s_bridge_dir)/boom_native_decoder.cpp $(difftest_s_bridge_dir)/boom_native_source.cpp $(difftest_s_bridge_dir)/boom_session_sink.cpp
+ifeq ($(DIFFTEST_S_DUT),boom)
+difftest_s_native_sources := boom_native_decoder boom_native_source boom_session_sink
+difftest_s_adapter_sources := native_collector retirement_snapshot word_bytes boom_event_adapter
+else
+difftest_s_native_sources := rocket_native_decoder rocket_session_sink
+difftest_s_adapter_sources := native_adapter cache_tracker event_emitter retirement_capture
+endif
+EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_bridge_dir)/,$(addsuffix .cpp,$(difftest_s_native_sources)))
 EXTRA_SIM_SOURCES += $(difftest_s_host_dir)/globalmem_storage.cpp
 EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_host_dir)/rvwmo/,$(addsuffix .cpp,host_session memory_image spike_reference_pool spike_reference_stepper session stream checker_event_consumer checker memory ppo dependency lrsc))
-EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_host_dir)/adapters/boom/,$(addsuffix .cpp,native_collector retirement_snapshot word_bytes boom_event_adapter))
+EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_host_dir)/adapters/$(DIFFTEST_S_DUT)/,$(addsuffix .cpp,$(difftest_s_adapter_sources)))
 EXTRA_SIM_CXXFLAGS += -I$(abspath $(DIFFTEST_S_SPIKE_HOME))
 EXTRA_SIM_LDFLAGS += $(abspath $(DIFFTEST_S_SPIKE_LIBRARY)) -Wl,-rpath,$(abspath $(dir $(DIFFTEST_S_SPIKE_LIBRARY)))
 endif
