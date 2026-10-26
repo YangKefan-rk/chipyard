@@ -97,7 +97,8 @@ include $(base_dir)/generators/tracegen/tracegen.mk
 include $(base_dir)/tools/torture.mk
 # Optional generator make fragments should not fail build if absent
 # Wildcard include for standardized per-generator make fragments
--include $(wildcard $(base_dir)/generators/*/chipyard.mk)
+GENERATOR_MAKE_FRAGMENTS ?= $(wildcard $(base_dir)/generators/*/chipyard.mk)
+-include $(GENERATOR_MAKE_FRAGMENTS)
 
 
 #########################################################################################

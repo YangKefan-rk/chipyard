@@ -5,6 +5,7 @@ import freechips.rocketchip.subsystem.{InSubsystem, TilesLocated}
 import org.chipsalliance.cde.config.Config
 
 class WithDifftestSObservationExport extends Config(
+  new chipyard.difftest.WithDifftestSNativeSimulation ++
   new chipyard.difftest.WithDifftestSObservationPunchthrough ++
   new Config((site, here, up) => {
     case chipyard.difftest.DifftestSObservationKey => true
