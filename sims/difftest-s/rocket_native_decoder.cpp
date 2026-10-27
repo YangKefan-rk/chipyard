@@ -254,6 +254,14 @@ struct RocketNativeDecoder::State {
       throw result;
   }
 
+  void require_store_transition(CheckResult result) {
+    if (result.status == CheckStatus::Pending)
+      throw CheckResult{CheckStatus::Incomplete, result.rule,
+                        "Rocket store-group transition could not retain a complete source edge: " + result.message};
+    if (!result)
+      throw result;
+  }
+
   bool in_scope(uint64_t token) const {
     return !configuration.entry_pc || (entry_token && token >= *entry_token);
   }
@@ -485,8 +493,8 @@ struct RocketNativeDecoder::State {
     capture(adapter->accept_store(fields.accepted.read(sample, source(cycle))));
     if (store_groups) {
       rocket::CacheStoreMember member;
-      require(adapter->store_member(id, member));
-      require(store_groups->accept(member));
+      require_store_transition(adapter->store_member(id, member));
+      require_store_transition(store_groups->accept(member));
     }
   }
 
@@ -517,7 +525,7 @@ struct RocketNativeDecoder::State {
         fields.drain_data.read(sample), narrow_byte(fields.drain_mask.read(sample)), position},
         narrow_byte(group_fields.physical_mask.read(sample)), static_cast<bool>(group_fields.second_slot.read(sample))};
     rocket::StoreGroupObservation group;
-    require(store_groups->capture_drain(drain, group));
+    require_store_transition(store_groups->capture_drain(drain, group));
     for (const auto &member : group.members) {
       const auto &association = request(member.request_id);
       if (!association.token || !association.qualified_store || *association.token != member.store.token ||
@@ -526,15 +534,11 @@ struct RocketNativeDecoder::State {
       if (!publications.emplace(member.request_id, position).second)
         throw std::invalid_argument("Rocket merged publication member was physically drained twice");
     }
-    rocket::CaptureResult result;
-    if (group.members.size() == 1)
-      result = adapter->publish({drain.actual, position.producer_sequence});
-    else
-      result = adapter->publish_group(group, position.producer_sequence);
+    const auto result = adapter->publish_group(group, position.producer_sequence);
     require(result.check);
     if (!result.consumed)
       throw CheckResult{CheckStatus::Incomplete, 0, "Rocket merged publication could not transfer lossless ownership"};
-    require(store_groups->acknowledge_drain(group.anchor_request_id));
+    require_store_transition(store_groups->acknowledge_drain(group.anchor_request_id));
     collect_output();
   }
 
@@ -558,6 +562,9 @@ struct RocketNativeDecoder::State {
       throw std::invalid_argument("Rocket merge has no accepted incoming member or conflicts with another slot transition");
     if (maintenance && (!second_slot || !maintenance_pending))
       throw std::invalid_argument("Rocket maintenance drain has no matching pending maintenance slot");
+    if (maintenance)
+      throw CheckResult{CheckStatus::Incomplete, 0,
+                       "Rocket ECC correction requires an independent maintenance-byte audit"};
     bool first_slot_drained = false;
     if (drain && second_slot) {
       if (maintenance)
@@ -582,7 +589,7 @@ struct RocketNativeDecoder::State {
     // retain that accepted member before releasing the physical first slot.
     accept_store(sample, cycle);
     if (merge)
-      require(store_groups->merge(fields.accepted.id.read(sample), group_fields.merge_target.read(sample), source(cycle)));
+      require_store_transition(store_groups->merge(fields.accepted.id.read(sample), group_fields.merge_target.read(sample), source(cycle)));
     if (advance) {
       if (maintenance_advance) {
         if (fields.accepted.valid.read(sample) || maintenance_pending)
@@ -591,7 +598,7 @@ struct RocketNativeDecoder::State {
       } else {
         if (maintenance_pending)
           throw std::invalid_argument("Rocket logical store advances over a pending maintenance write");
-        require(store_groups->advance(group_fields.advance_id.read(sample), source(cycle)));
+        require_store_transition(store_groups->advance(group_fields.advance_id.read(sample), source(cycle)));
       }
     }
     if (drain && !second_slot && !first_slot_drained) {
