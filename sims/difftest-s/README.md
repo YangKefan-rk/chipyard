@@ -75,7 +75,7 @@ same observation and terminal contracts. Its compatible source revisions are:
 | Component | Merge-support revision |
 | --- | --- |
 | Rocket gitlink | `fde46422f576bd655c09e1827087fcf2d56388d9` |
-| Difftest-S | `fd6eb3fa17322495a018e9268bb9fbb43d38a40c` |
+| Difftest-S `main` | `60f8f0f06ad88fc959f0c1af2f3e77c265c0d87d` |
 | Reference Spike | `752638c4034e385fd910a9ea1e0e0d179ffbeea2` |
 
 Regenerate the RTL and native layout registry when selecting this profile.
