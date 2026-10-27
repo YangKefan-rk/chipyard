@@ -1,6 +1,6 @@
 package chipyard
 
-import freechips.rocketchip.rocket.EnableDifftestRocketCache
+import freechips.rocketchip.rocket.{EnableDifftestRocketCache, RocketDCacheConfig}
 import freechips.rocketchip.subsystem.{InSubsystem, TilesLocated}
 import org.chipsalliance.cde.config.Config
 
@@ -56,6 +56,15 @@ class QuadRocketDifftestSConfig extends Config(
   new WithDifftestSRocketObservations ++
   new freechips.rocketchip.rocket.WithNBigCores(4) ++
   new chipyard.config.AbstractConfig
+)
+
+class WithDifftestSRocketStoreMerging extends RocketDCacheConfig(_.copy(
+  dataECC = Some("parity"), dataECCBytes = 2
+))
+
+class QuadRocketMergeDifftestSConfig extends Config(
+  new WithDifftestSRocketStoreMerging ++
+  new QuadRocketDifftestSConfig
 )
 
 class QuadSmallBoomV4DifftestSConfig extends Config(

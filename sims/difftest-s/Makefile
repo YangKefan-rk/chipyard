@@ -40,7 +40,7 @@ difftest_s_native_sources := boom_native_decoder boom_native_source boom_session
 difftest_s_adapter_sources := native_collector retirement_snapshot word_bytes boom_event_adapter
 else
 difftest_s_native_sources := rocket_native_decoder rocket_session_sink
-difftest_s_adapter_sources := native_adapter cache_tracker event_emitter retirement_capture
+difftest_s_adapter_sources := native_adapter cache_tracker event_emitter retirement_capture store_groups
 endif
 EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_bridge_dir)/,$(addsuffix .cpp,$(difftest_s_native_sources)))
 EXTRA_SIM_SOURCES += $(difftest_s_host_dir)/globalmem_storage.cpp

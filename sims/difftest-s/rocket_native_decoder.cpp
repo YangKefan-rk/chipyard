@@ -1,6 +1,7 @@
 #include "rocket_native_decoder.h"
 #include "native_fields.h"
 #include "adapters/rocket/native_adapter.h"
+#include "adapters/rocket/store_groups.h"
 #include "rvwmo/producer_ids.h"
 #include <algorithm>
 #include <map>
@@ -82,10 +83,27 @@ struct StoreFields : ValidFields {
   }
 };
 
+struct StoreGroupFields {
+  NativeField ecc_bytes, advance, advance_id, advance_maintenance, merge_target, physical_mask, second_slot;
+
+  explicit StoreGroupFields(const NativeFields &fields)
+      : ecc_bytes(fields.field("cache.eccBytes")), advance(fields.field("cache.storeAdvance")),
+        advance_id(fields.field("cache.storeAdvanceRequestId")),
+        advance_maintenance(fields.field("cache.storeAdvanceMaintenance")),
+        merge_target(fields.field("cache.storeMergeTargetRequestId")),
+        physical_mask(fields.field("cache.storeDrain.bits.physicalMask")),
+        second_slot(fields.field("cache.storeDrain.bits.secondSlot")) {
+    if (ecc_bytes.width > 8 || advance.width != 1 || advance_id.width != 64 ||
+        advance_maintenance.width != 1 || merge_target.width != 64 || physical_mask.width != 8 || second_slot.width != 1)
+      throw std::invalid_argument("Rocket store-group observation widths are unsupported");
+  }
+};
+
 struct Fields {
   NativeFields metadata;
   NativeField hart, core_requestor, cache_requestors, cache_available;
   std::optional<NativeField> cache_idle;
+  std::optional<StoreGroupFields> store_groups;
   ValidFields allocate, core_request, cache_request, s1_rejected, result, load, drain, retire, late_write, trap;
   InstructionFields allocation, retirement;
   AccessFields core_access, cache_access, result_access, load_access;
@@ -146,6 +164,18 @@ struct Fields {
         if (cache_idle->width != 1)
           throw std::invalid_argument("Rocket physical cache-idle proof must have one bit");
       }
+    size_t store_group_fields = 0;
+    for (size_t index = 0; index < layout.field_count; ++index) {
+      const std::string_view path(layout.fields[index].path);
+      if (path == "cache.eccBytes" || path == "cache.storeAdvanceRequestId" ||
+          path == "cache.storeAdvanceMaintenance" || path == "cache.storeMergeTargetRequestId" ||
+          path == "cache.storeDrain.bits.physicalMask")
+        ++store_group_fields;
+    }
+    if (store_group_fields && store_group_fields != 5)
+      throw std::invalid_argument("Rocket native layout has partial store-group observations");
+    if (store_group_fields)
+      store_groups.emplace(metadata);
     terminal_wfi = optional_flag("terminal.wfi");
     pipeline_empty = optional_flag("core.pipelineEmpty");
     pending_integer_writeback = optional_flag("core.pendingIntegerWriteback");
@@ -182,6 +212,7 @@ struct RocketNativeDecoder::State {
   RocketPublicationSource publication_source;
   Fields fields;
   std::unique_ptr<rocket::NativeAdapter> adapter;
+  std::unique_ptr<rocket::StoreGroupTracker> store_groups;
   std::map<uint64_t, Instruction> instructions;
   std::map<uint64_t, uint64_t> uid_tokens;
   std::map<uint64_t, Request> requests;
@@ -191,6 +222,8 @@ struct RocketNativeDecoder::State {
   RocketDecodedFrame *output = nullptr;
   uint64_t epoch = 0, next_sequence = 1, next_uid = 1;
   uint32_t core_requestor = 0, requestors = 0;
+  uint8_t ecc_bytes = 1;
+  bool maintenance_pending = false;
   CheckResult failure;
   bool started = false;
 
@@ -255,13 +288,17 @@ struct RocketNativeDecoder::State {
           }
         } else if (event.kind == rvwmo::RuntimeEventKind::StorePublish) {
           const auto &published = std::get<rvwmo::StorePublishEvent>(event.payload);
-          if (published.members.size() != 1)
-            throw std::invalid_argument("Rocket ordinary publication has unexpected merged members");
-          auto &live = instruction(uid_tokens.at(published.members.front().id.uid));
-          if (!live.request || !publications.erase(*live.request))
-            throw std::invalid_argument("Rocket publication has no retained physical drain");
-          requests.erase(*live.request);
-          live.request.reset();
+          if (published.members.empty())
+            throw std::invalid_argument("Rocket publication has no logical members");
+          std::set<uint64_t> released_requests;
+          for (const auto &member : published.members) {
+            auto &live = instruction(uid_tokens.at(member.id.uid));
+            if (live.id != member.id || !live.request || !released_requests.insert(*live.request).second ||
+                !publications.erase(*live.request))
+              throw std::invalid_argument("Rocket publication member has no unique retained physical drain");
+            requests.erase(*live.request);
+            live.request.reset();
+          }
         }
         output->batch.events.push_back(event);
       }
@@ -304,6 +341,13 @@ struct RocketNativeDecoder::State {
                       configuration.capacity, 64, configuration.publication_producer};
     config.cache = {core_requestor, requestors, configuration.capacity};
     adapter = std::make_unique<rocket::NativeAdapter>(config);
+    if (fields.store_groups) {
+      ecc_bytes = narrow_byte(fields.store_groups->ecc_bytes.read(sample));
+      if (!ecc_bytes || ecc_bytes > 8 || (ecc_bytes & (ecc_bytes - 1)))
+        throw std::invalid_argument("Rocket cache reports an invalid ECC granule");
+      store_groups = std::make_unique<rocket::StoreGroupTracker>(rocket::StoreGroupConfiguration{
+          ecc_bytes, configuration.capacity});
+    }
     started = true;
   }
 
@@ -421,35 +465,139 @@ struct RocketNativeDecoder::State {
         requests.erase(id);
       }
     }
-    if (fields.accepted.valid.read(sample)) {
-      const auto id = fields.accepted.id.read(sample);
-      auto &association = request(id);
-      if (association.discarded)
-        throw CheckResult{CheckStatus::Violation, 0, "Rocket squashed store reached cache acceptance"};
-      if (!association.token) {
-        ++bootstrap.stores;
-        throw CheckResult{CheckStatus::Incomplete, 0,
-          "Rocket cached bootstrap or implicit store changes memory outside the independent entry-state contract"};
-      }
-      if (!association.qualified_store)
-        throw std::invalid_argument("Rocket store acceptance lacks a successful cached permission hit");
-      capture(adapter->accept_store(fields.accepted.read(sample, source(cycle))));
+    cache_stores(sample, cycle);
+  }
+
+  void accept_store(const Sample &sample, uint64_t cycle) {
+    if (!fields.accepted.valid.read(sample))
+      return;
+    const auto id = fields.accepted.id.read(sample);
+    auto &association = request(id);
+    if (association.discarded)
+      throw CheckResult{CheckStatus::Violation, 0, "Rocket squashed store reached cache acceptance"};
+    if (!association.token) {
+      ++bootstrap.stores;
+      throw CheckResult{CheckStatus::Incomplete, 0,
+        "Rocket cached bootstrap or implicit store changes memory outside the independent entry-state contract"};
     }
-    if (fields.merge.read(sample))
-      throw CheckResult{CheckStatus::Unsupported, 0, "Rocket merged stores require complete per-byte writer membership"};
-    if (fields.drain.valid.read(sample) && !fields.maintenance.read(sample)) {
-      const auto id = fields.drain_id.read(sample);
-      auto &association = request(id);
-      if (!association.token || !association.qualified_store)
-        throw CheckResult{CheckStatus::Incomplete, 0, "Rocket physical drain has no qualified committed writer"};
-      const auto position = publication_source(cycle);
-      if (position.cycle != cycle || !position.producer_sequence ||
-          position.qualified_phase == SourcePosition::cycle_closed_phase)
-        throw std::invalid_argument("Rocket fabric source allocator changed the observed drain edge");
-      if (!publications.emplace(id, position).second)
-        throw std::invalid_argument("Rocket native store drain was observed twice");
-      capture(adapter->publish({{id, fields.drain_address.read(sample), fields.drain_data.read(sample),
-                               narrow_byte(fields.drain_mask.read(sample)), position}, position.producer_sequence}));
+    if (!association.qualified_store)
+      throw std::invalid_argument("Rocket store acceptance lacks a successful cached permission hit");
+    capture(adapter->accept_store(fields.accepted.read(sample, source(cycle))));
+    if (store_groups) {
+      rocket::CacheStoreMember member;
+      require(adapter->store_member(id, member));
+      require(store_groups->accept(member));
+    }
+  }
+
+  SourcePosition publication_position(uint64_t cycle) {
+    const auto position = publication_source(cycle);
+    if (position.cycle != cycle || !position.producer_sequence ||
+        position.qualified_phase == SourcePosition::cycle_closed_phase)
+      throw std::invalid_argument("Rocket fabric source allocator changed the observed drain edge");
+    return position;
+  }
+
+  void publish_singleton(const Sample &sample, uint64_t cycle) {
+    const auto id = fields.drain_id.read(sample);
+    const auto &association = request(id);
+    if (!association.token || !association.qualified_store)
+      throw CheckResult{CheckStatus::Incomplete, 0, "Rocket physical drain has no qualified committed writer"};
+    const auto position = publication_position(cycle);
+    if (!publications.emplace(id, position).second)
+      throw std::invalid_argument("Rocket native store drain was observed twice");
+    capture(adapter->publish({{id, fields.drain_address.read(sample), fields.drain_data.read(sample),
+                             narrow_byte(fields.drain_mask.read(sample)), position}, position.producer_sequence}));
+  }
+
+  void capture_store_group(const Sample &sample, uint64_t cycle) {
+    const auto &group_fields = *fields.store_groups;
+    const auto position = publication_position(cycle);
+    rocket::CacheStoreDrain drain{{fields.drain_id.read(sample), fields.drain_address.read(sample),
+        fields.drain_data.read(sample), narrow_byte(fields.drain_mask.read(sample)), position},
+        narrow_byte(group_fields.physical_mask.read(sample)), static_cast<bool>(group_fields.second_slot.read(sample))};
+    rocket::StoreGroupObservation group;
+    require(store_groups->capture_drain(drain, group));
+    for (const auto &member : group.members) {
+      const auto &association = request(member.request_id);
+      if (!association.token || !association.qualified_store || *association.token != member.store.token ||
+          instruction(*association.token).next_attempt != member.attempt)
+        throw std::invalid_argument("Rocket merged publication member changed its qualified cache attempt");
+      if (!publications.emplace(member.request_id, position).second)
+        throw std::invalid_argument("Rocket merged publication member was physically drained twice");
+    }
+    rocket::CaptureResult result;
+    if (group.members.size() == 1)
+      result = adapter->publish({drain.actual, position.producer_sequence});
+    else
+      result = adapter->publish_group(group, position.producer_sequence);
+    require(result.check);
+    if (!result.consumed)
+      throw CheckResult{CheckStatus::Incomplete, 0, "Rocket merged publication could not transfer lossless ownership"};
+    require(store_groups->acknowledge_drain(group.anchor_request_id));
+    collect_output();
+  }
+
+  void cache_stores(const Sample &sample, uint64_t cycle) {
+    const bool drain = fields.drain.valid.read(sample);
+    const bool maintenance = drain && fields.maintenance.read(sample);
+    if (!store_groups) {
+      accept_store(sample, cycle);
+      if (fields.merge.read(sample))
+        throw CheckResult{CheckStatus::Unsupported, 0, "Rocket merged stores require complete per-byte writer membership"};
+      if (drain && !maintenance)
+        publish_singleton(sample, cycle);
+      return;
+    }
+    const auto &group_fields = *fields.store_groups;
+    const bool advance = group_fields.advance.read(sample);
+    const bool merge = fields.merge.read(sample);
+    const bool second_slot = group_fields.second_slot.read(sample);
+    const bool maintenance_advance = advance && group_fields.advance_maintenance.read(sample);
+    if (merge && (drain || advance || !fields.accepted.valid.read(sample)))
+      throw std::invalid_argument("Rocket merge has no accepted incoming member or conflicts with another slot transition");
+    if (maintenance && (!second_slot || !maintenance_pending))
+      throw std::invalid_argument("Rocket maintenance drain has no matching pending maintenance slot");
+    bool first_slot_drained = false;
+    if (drain && second_slot) {
+      if (maintenance)
+        maintenance_pending = false;
+      else {
+        if (maintenance_pending)
+          throw std::invalid_argument("Rocket logical store drain replaced an unobserved maintenance write");
+        capture_store_group(sample, cycle);
+      }
+    } else if (drain) {
+      const auto drain_id = fields.drain_id.read(sample);
+      const bool accepted_is_drain = fields.accepted.valid.read(sample) &&
+                                     fields.accepted.id.read(sample) == drain_id;
+      if (!accepted_is_drain) {
+        if (maintenance)
+          throw std::invalid_argument("Rocket first-slot drain cannot be a maintenance write");
+        capture_store_group(sample, cycle);
+        first_slot_drained = true;
+      }
+    }
+    // The drain names pre-edge storage. When it names the incoming store itself,
+    // retain that accepted member before releasing the physical first slot.
+    accept_store(sample, cycle);
+    if (merge)
+      require(store_groups->merge(fields.accepted.id.read(sample), group_fields.merge_target.read(sample), source(cycle)));
+    if (advance) {
+      if (maintenance_advance) {
+        if (fields.accepted.valid.read(sample) || maintenance_pending)
+          throw std::invalid_argument("Rocket maintenance advance conflicts with a logical store or occupied slot");
+        maintenance_pending = true;
+      } else {
+        if (maintenance_pending)
+          throw std::invalid_argument("Rocket logical store advances over a pending maintenance write");
+        require(store_groups->advance(group_fields.advance_id.read(sample), source(cycle)));
+      }
+    }
+    if (drain && !second_slot && !first_slot_drained) {
+      if (maintenance)
+        throw std::invalid_argument("Rocket first-slot drain cannot be a maintenance write");
+      capture_store_group(sample, cycle);
     }
   }
 
@@ -543,6 +691,7 @@ struct RocketNativeDecoder::State {
     }
     output->publication_closed_through = fabric;
     output->tracked_work_drained = instructions.empty() && requests.empty() && publications.empty() &&
+                                   !maintenance_pending && (!store_groups || store_groups->finalize()) &&
                                    (!configuration.entry_pc || entry_token.has_value());
   }
 
@@ -583,6 +732,8 @@ struct RocketNativeDecoder::State {
         throw std::invalid_argument("Rocket native source epoch or cycle changed discontinuously");
       if (fields.core_requestor.read(sample) != core_requestor || fields.cache_requestors.read(sample) != requestors)
         throw std::invalid_argument("Rocket native cache requestor roster changed");
+      if (fields.store_groups && fields.store_groups->ecc_bytes.read(sample) != ecc_bytes)
+        throw std::invalid_argument("Rocket cache ECC granule changed within one observation epoch");
       last_cycle = frame.source_cycle;
       RocketDecodedFrame staged;
       output = &staged;
@@ -648,7 +799,12 @@ CheckResult RocketNativeDecoder::finalize() const {
   auto result = state_->adapter->finalize();
   if (!result)
     return {result.status == CheckStatus::Pending ? CheckStatus::Incomplete : result.status, result.rule, result.message};
-  if (!state_->instructions.empty() || !state_->requests.empty() || !state_->publications.empty())
+  if (state_->store_groups) {
+    result = state_->store_groups->finalize();
+    if (!result)
+      return {result.status == CheckStatus::Pending ? CheckStatus::Incomplete : result.status, result.rule, result.message};
+  }
+  if (!state_->instructions.empty() || !state_->requests.empty() || !state_->publications.empty() || state_->maintenance_pending)
     return {CheckStatus::Incomplete, 0, "Rocket native decoder has undrained instruction or cache facts"};
   return {};
 }
