@@ -7,9 +7,10 @@ presets, with native observations and a synchronous simulation clock:
 | --- | --- | --- |
 | `QuadSmallBoomV4DifftestSConfig` | `boom.v4.common.WithNSmallBooms(4)` | 4 |
 | `QuadRocketDifftestSConfig` | `freechips.rocketchip.rocket.WithNBigCores(4)` | 4 |
+| `QuadRocketMergeDifftestSConfig` | Big Rocket, parity ECC with two-byte granules | 4 |
 
 The Rocket profile differs from this Chipyard revision's upstream
-`QuadRocketConfig`, which uses `WithNHugeCores(4)`. Both Difftest-S profiles
+`QuadRocketConfig`, which uses `WithNHugeCores(4)`. These Difftest-S profiles
 export observations and disable tile clock gating; they are integration
 configurations rather than unchanged upstream configurations.
 
@@ -64,6 +65,30 @@ make -f ../difftest-s/Makefile CONFIG=QuadSmallBoomV4DifftestSConfig \
 For Rocket, build Spike with `CPU=ROCKET_CHIP` in a separate output directory,
 then use `CONFIG=QuadRocketDifftestSConfig`, `DIFFTEST_S_DUT=rocket` and that
 profile's library. Do not reuse BOOM reference objects for Rocket.
+
+To exercise merged pending stores, use `CONFIG=QuadRocketMergeDifftestSConfig`
+with the same Rocket reference profile. The default Rocket configuration uses
+one-byte ECC granules and does not merge pending stores. The merge profile
+changes only the DCache ECC settings; it retains four Big Rocket cores and the
+same observation and terminal contracts. Its compatible source revisions are:
+
+| Component | Merge-support revision |
+| --- | --- |
+| Rocket gitlink | `fde46422f576bd655c09e1827087fcf2d56388d9` |
+| Difftest-S | `fd6eb3fa17322495a018e9268bb9fbb43d38a40c` |
+| Reference Spike | `752638c4034e385fd910a9ea1e0e0d179ffbeea2` |
+
+Regenerate the RTL and native layout registry when selecting this profile.
+The merged-store path preserves every original logical member, including
+stores fully overwritten inside the group, and independently audits its
+address, data and mask against REF. It checks the ECC preservation bytes
+against the GlobalMem prefix without changing their logical writer identity.
+One physical drain remains one observed source edge. Logical members use
+modeled same-hart order only after all registered producers close a cycle
+containing no other memory effect; an ambiguous cycle remains `Incomplete`.
+Actual ECC correction drains also require an independent maintenance-byte
+audit and currently return `Incomplete`. Selecting parity ECC does not itself
+exercise that correction path.
 
 `DIFFTEST_S_SESSION=1` compiles the native consumer, private DUT adapter and
 public HostSession together. With the default `DIFFTEST_S_SESSION=0`, the
