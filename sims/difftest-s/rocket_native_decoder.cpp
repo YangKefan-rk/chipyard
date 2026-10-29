@@ -733,6 +733,11 @@ struct RocketNativeDecoder::State {
         throw std::invalid_argument("Rocket actual hart ID differs from the exported native port");
       if (!fields.cache_available.read(sample))
         throw CheckResult{CheckStatus::Unsupported, 0, "Rocket native cache observations are unavailable"};
+      // The CPU SRAM read and the pstore write share one physical data-array
+      // arbiter. Use the request's read edge, not a potentially later S2 load
+      // result: an apparent same-hart read/drain edge is inconsistent evidence.
+      if (fields.array_read.read(sample) && fields.drain.valid.read(sample))
+        throw std::invalid_argument("Rocket single-port SRAM reports a load read and store drain on one source edge");
       if (!started)
         initialize(sample, frame.epoch);
       if (frame.epoch != epoch || (last_cycle && (*last_cycle == UINT64_MAX || frame.source_cycle != *last_cycle + 1)))
