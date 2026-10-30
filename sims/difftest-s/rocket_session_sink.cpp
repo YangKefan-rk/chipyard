@@ -313,7 +313,8 @@ private:
         return {};
       const auto &facts = *terminal_facts_[hart];
       auto result = terminal_observer_->observe(hart, cycle, facts.wfi, facts.pipeline_empty,
-          facts.pending_integer_writeback, facts.wfi_wake_pending, terminal_cache_idle_[hart],
+          facts.pending_integer_writeback || facts.pending_floating_writeback,
+          facts.wfi_wake_pending, terminal_cache_idle_[hart],
           terminal_adapter_drained_[hart]);
       if (!result)
         return result;
@@ -406,7 +407,11 @@ private:
         const rvwmo::OperationId id{retired.hart, retired.epoch, retired.uid, 0};
         const auto snapshot = staged_retirements_.find(id);
         if (snapshot == staged_retirements_.end())
-          return {CheckStatus::Incomplete, 0, "Rocket closed retirement awaits independent actual writeback"};
+          return {CheckStatus::Incomplete, 0,
+              "Rocket closed retirement awaits independent actual writeback: hart=" +
+              std::to_string(retired.hart) + " uid=" + std::to_string(retired.uid) +
+              " pc=" + std::to_string(retired.pc) + " source=" +
+              std::to_string(event.source.cycle) + " closed=" + std::to_string(through)};
         retirements.push_back(snapshot->second);
         retired_ids.push_back(id);
       }
@@ -481,15 +486,12 @@ private:
       if (!result)
         return result;
       auto &initialized = initialized_dependencies_[retirement.id.hart];
-      for (const auto unit : dependencies.sources) {
-        if ((!hartbreaker_bootstrap_enabled_ && unit >= 32) || (unit && !initialized.count(unit)))
-          return {CheckStatus::Unsupported, 0, hartbreaker_bootstrap_enabled_
-                  ? "Rocket entry PC " + std::to_string(retirement.pc) +
-                    " reads uninitialized dependency unit " + std::to_string(unit)
-                  : "Rocket entry program reads a register outside its independently initialized state"};
-      }
+      for (const auto unit : dependencies.sources)
+        if (unit && !initialized.count(unit))
+          return {CheckStatus::Unsupported, 0, "Rocket entry PC " + std::to_string(retirement.pc) +
+                  " reads uninitialized dependency unit " + std::to_string(unit)};
       for (const auto unit : dependencies.destinations)
-        if (unit && (hartbreaker_bootstrap_enabled_ || unit < 32))
+        if (unit)
           initialized.insert(unit);
     }
     return {};

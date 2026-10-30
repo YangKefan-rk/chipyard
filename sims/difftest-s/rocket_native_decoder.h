@@ -21,6 +21,7 @@ struct RocketTerminalFacts {
   bool pipeline_empty = false;
   bool pending_integer_writeback = false;
   bool wfi_wake_pending = false;
+  bool pending_floating_writeback = false;
 };
 
 struct RocketBootstrapCounts {

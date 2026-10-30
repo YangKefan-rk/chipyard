@@ -143,9 +143,13 @@ A successful run must exit zero and emit exactly one `DIFFTEST_S_FINAL` report
 with verdict `Pass`, all four harts checked and all required producers drained.
 Missing order or terminal evidence yields `Incomplete`; unsupported operations
 must not be interpreted as successful validation. The accepted scope is an
-initialized scalar-RAM prefix, not full ISA or full RVWMO completeness. Generic
-AMO/LRSC, FP/vector, split accesses, MMIO, traps and interrupts are outside this
-acceptance scope.
+initialized RAM prefix with explicitly decoded RV64 F/D register architecture, not
+full ISA or full RVWMO completeness. FP register arithmetic/moves and exact FCSR
+read snapshots are compared against independently stepped Spike. Floating-point
+load/store encodings are still rejected by the public memory consumer, so FP
+memory and its PPO are **not** certified by an architecture-only Pass. Generic
+AMO/LRSC, vector, split accesses, MMIO, traps and interrupts remain outside
+this acceptance scope.
 
 ### Optional HartBreaker entry checkpoint
 
@@ -166,7 +170,7 @@ write and execution of that excluded prefix remain **outside** the checked
 scope. A changed prefix, unknown entry, or unknown hart is rejected.
 
 This option does not enable arbitrary HartBreaker ELFs: uninitialized CSR
-dependencies, FP, AMO/LRSC, and HartBreaker's native terminal behavior still
+dependencies, FP memory, AMO/LRSC, and HartBreaker's native terminal behavior still
 need independent modeling. A successful prefix checkpoint is not a Difftest-S
 Pass; an unsupported suffix remains `Unsupported` or `Incomplete`. The default
 profile and terminal contract are unchanged when the option is unset.

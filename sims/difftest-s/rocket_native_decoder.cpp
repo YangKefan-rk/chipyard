@@ -99,6 +99,18 @@ struct StoreGroupFields {
   }
 };
 
+struct FpWriteFields {
+  ValidFields write;
+  NativeField token, known, destination, data;
+  FpWriteFields(const NativeFields &fields, const std::string &path)
+      : write(fields, path), token(fields.field(path + ".bits.token")),
+        known(fields.field(path + ".bits.identityKnown")),
+        destination(fields.field(path + ".bits.destination")), data(fields.field(path + ".bits.data")) {
+    if (token.width != 64 || known.width != 1 || destination.width != 5 || data.width != 64)
+      throw std::invalid_argument("Rocket floating writeback observation has unsupported widths");
+  }
+};
+
 struct Fields {
   NativeFields metadata;
   NativeField hart, core_requestor, cache_requestors, cache_available;
@@ -114,6 +126,8 @@ struct Fields {
   NativeField retire_memory, retire_command, late_token, late_known, late_destination, late_data;
   NativeField execute_killed, execute_token, memory_killed, memory_token, wb_rejected, wb_token;
   std::optional<NativeField> terminal_wfi, pipeline_empty, pending_integer_writeback, wfi_wake_pending;
+  std::optional<NativeField> floating_write, pending_floating_writeback, fcsr;
+  std::vector<FpWriteFields> floating_writes;
 
   explicit Fields(const NativeProbeLayout &layout)
       : metadata(layout), hart(metadata.field("core.hart")),
@@ -176,6 +190,20 @@ struct Fields {
       throw std::invalid_argument("Rocket native layout has partial store-group observations");
     if (store_group_fields)
       store_groups.emplace(metadata);
+    floating_write = optional_flag("core.retire.bits.floatingPointWrite");
+    pending_floating_writeback = optional_flag("core.pendingFloatingPointWriteback");
+    if (floating_write) {
+      fcsr = metadata.field("core.fcsrValue");
+      if (fcsr->width != 8 || !pending_floating_writeback)
+        throw std::invalid_argument("Rocket FP layout lacks FCSR or pending-write evidence");
+      const auto ports = metadata.records("core.floatingPointWrites");
+      if (ports.size() != 2)
+        throw std::invalid_argument("Rocket FP layout must describe both real FPU write ports");
+      for (const auto &path : ports)
+        floating_writes.emplace_back(metadata, path);
+    } else if (pending_floating_writeback || !metadata.records("core.floatingPointWrites").empty()) {
+      throw std::invalid_argument("Rocket FP layout contains only a partial observation set");
+    }
     terminal_wfi = optional_flag("terminal.wfi");
     pipeline_empty = optional_flag("core.pipelineEmpty");
     pending_integer_writeback = optional_flag("core.pendingIntegerWriteback");
@@ -660,10 +688,21 @@ struct RocketNativeDecoder::State {
       throw std::invalid_argument("Rocket native retirement was observed twice");
     if (live.unsupported_memory)
       throw CheckResult{CheckStatus::Unsupported, 0, "Rocket retired an uncached or implicit memory access"};
+    if (fields.floating_point.read(sample) && !fields.floating_write)
+      throw CheckResult{CheckStatus::Unsupported, 0, "Rocket FP retirement requires both typed FPU write ports"};
     rocket::NativeRetirement retirement{token, observed.pc, observed.instruction, source(cycle),
         static_cast<bool>(fields.integer_write.read(sample)), static_cast<bool>(fields.deferred_write.read(sample)),
         narrow_byte(fields.destination.read(sample)), fields.write_data.read(sample),
         static_cast<bool>(fields.floating_point.read(sample))};
+    retirement.floating_write = fields.floating_write && fields.floating_write->read(sample);
+    const uint32_t raw = observed.instruction;
+    const uint32_t function = (raw >> 12) & 7;
+    const uint32_t csr = raw >> 20;
+    const bool readonly_fcsr = (raw & 0x7f) == 0x73 && (csr == 1 || csr == 2 || csr == 3) &&
+        (function == 2 || function == 3 || function == 6 || function == 7) && ((raw >> 15) & 31) == 0;
+    if (readonly_fcsr && fields.fcsr && fields.pending_floating_writeback &&
+        !fields.pending_floating_writeback->read(sample))
+      retirement.fcsr = narrow_byte(fields.fcsr->read(sample));
     live.retired = true;
     capture(adapter->retire({retirement, observed.source}));
   }
@@ -673,7 +712,7 @@ struct RocketNativeDecoder::State {
     collect_output();
     std::optional<uint64_t> earliest;
     for (const auto &entry : instructions)
-      if (!entry.second.emitted)
+      if (!entry.second.emitted || !entry.second.snapshot_delivered)
         earliest = !earliest ? entry.second.allocation.source.cycle
                             : std::min(*earliest, entry.second.allocation.source.cycle);
     if (!earliest || *earliest != 0) {
@@ -771,6 +810,11 @@ struct RocketNativeDecoder::State {
       if (fields.late_write.valid.read(sample) && in_scope(fields.late_token.read(sample)))
         capture(adapter->late_write({fields.late_token.read(sample), static_cast<bool>(fields.late_known.read(sample)),
             narrow_byte(fields.late_destination.read(sample)), fields.late_data.read(sample), source(frame.source_cycle)}));
+      for (const auto &port : fields.floating_writes) {
+        if (port.write.valid.read(sample) && in_scope(port.token.read(sample)))
+          capture(adapter->floating_write({port.token.read(sample), static_cast<bool>(port.known.read(sample)),
+              narrow_byte(port.destination.read(sample)), port.data.read(sample), source(frame.source_cycle)}));
+      }
       close_prefix(frame.source_cycle);
       if (fields.cache_idle)
         staged.physically_idle = fields.cache_idle->read(sample);
@@ -779,7 +823,8 @@ struct RocketNativeDecoder::State {
             static_cast<bool>(fields.terminal_wfi->read(sample)),
             static_cast<bool>(fields.pipeline_empty->read(sample)),
             static_cast<bool>(fields.pending_integer_writeback->read(sample)),
-            static_cast<bool>(fields.wfi_wake_pending->read(sample))};
+            static_cast<bool>(fields.wfi_wake_pending->read(sample)),
+            fields.pending_floating_writeback && fields.pending_floating_writeback->read(sample)};
       }
       output = nullptr;
       converted = std::move(staged);
