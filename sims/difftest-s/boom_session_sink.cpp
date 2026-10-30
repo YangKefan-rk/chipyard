@@ -56,8 +56,10 @@ public:
       if (!expected || !*expected)
         throw std::invalid_argument("HartBreaker terminal needs an independent expected tohost value");
       tohost_success_value_ = configured_number("DIFFTEST_S_BOOM_TOHOST_SUCCESS_VALUE", 0);
-      if (!tohost_success_value_)
-        throw std::invalid_argument("HartBreaker success tohost value cannot be zero");
+      // HartBreaker at the pinned generator revision defines TERMSIG=1.
+      // A caller-selected nonzero value must not turn a failing ELF into Pass.
+      if (tohost_success_value_ != 1)
+        throw std::invalid_argument("HartBreaker tohost success value must equal the generator's TERMSIG=1");
       if (layout->harts != 4)
         throw std::invalid_argument("HartBreaker terminal requires exactly four native BOOM harts");
       const auto terminal = resolve_hartbreaker_terminal(elf, memory_);
@@ -327,7 +329,9 @@ struct InstallBoomSession {
         throw std::runtime_error("native Runtime sink was registered more than once or after sampling started");
     } catch (const std::exception &error) {
       std::fprintf(stderr, "DIFFTEST-S BOOM Runtime initialization failed: %s\n", error.what());
-      std::abort();
+      // There is no configured checker session to finalize here. Reject this
+      // run as an invalid setup without a native process SIGABRT/core dump.
+      std::exit(EXIT_FAILURE);
     }
   }
 };
