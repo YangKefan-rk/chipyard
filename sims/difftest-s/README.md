@@ -153,7 +153,15 @@ acceptance scope.
 `DIFFTEST_S_START_AT_ELF=1`. It admits only the 16 exact instructions of the
 HartBreaker quadrocket timer-disable entry, verifies their bytes in the
 independently loaded ELF, computes the four-hart GPR checkpoint without DUT
-load results, and starts REF/retirement checks at `0x80000040`. The CLINT MMIO
+load results, and starts REF/retirement checks at `0x80000040`. The matching
+Rocket RTL explicitly resets CSR `mie` to zero; the native layout must include
+`core.mieValue`, and the first post-reset frame must observe zero on **all four
+harts**. The selected Chipyard boot ROM then executes `csrw mie,8` before the ELF.
+The scoped REF therefore starts with the independently fixed `mie=8`, and each
+hart must actually reach `0x80000040` with that value before its CSR is marked
+initialized. Reset and boot-entry values are checked separately; neither value
+is copied from a DUT CSR or load result. Old layouts without this witness fail
+closed, even when the option is set. The CLINT MMIO
 write and execution of that excluded prefix remain **outside** the checked
 scope. A changed prefix, unknown entry, or unknown hart is rejected.
 

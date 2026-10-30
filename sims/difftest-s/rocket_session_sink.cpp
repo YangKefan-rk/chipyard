@@ -1,5 +1,7 @@
 #include "rocket_native_decoder.h"
+#include "native_fields.h"
 #include "rocket_hartbreaker_bootstrap.h"
+#include "rocket_mie_contract.h"
 #include "rvwmo/dependency.h"
 #include "rvwmo/host_session.h"
 #include "rvwmo/memory_image.h"
@@ -122,6 +124,14 @@ public:
       const auto *hart_layout = find_native_layout(1, hart);
       if (!hart_layout || hart_layout->harts != layout->harts)
         throw std::invalid_argument("Rocket Runtime sink has an incomplete generated hart roster");
+      if (hartbreaker_bootstrap) {
+        const auto mie = NativeFields(*hart_layout).field("core.mieValue");
+        if (mie.width != 64)
+          throw std::invalid_argument("Rocket reset-MIE witness requires RV64 native observation");
+        const auto fields = NativeFields(*hart_layout);
+        mie_fields_.push_back({mie, fields.field("core.retire.valid"),
+            fields.field("core.retire.bits.instruction.pc")});
+      }
       auto &initial = config.initial_harts[hart];
       initial.pc = entry;
       initial.privilege = 3;
@@ -131,6 +141,7 @@ public:
         const auto checkpoint = hartbreaker_bootstrap_checkpoint(memory_, entry, hart);
         initial.pc = checkpoint.pc;
         std::copy(checkpoint.gpr.begin(), checkpoint.gpr.end(), initial.gpr);
+        initial.mie = RocketMieContract::entry_value;
         for (unsigned unit = 0; unit < checkpoint.initialized.size(); ++unit)
           if (checkpoint.initialized[unit])
             initialized_dependencies_[hart].insert(unit);
@@ -161,6 +172,8 @@ public:
         return observe_reference_store(store);
       };
     }
+    if (hartbreaker_bootstrap)
+      mie_contract_ = std::make_unique<RocketMieContract>(layout->harts);
     session_ = std::make_unique<rvwmo::HostSession>(memory_, std::move(config));
     if (!session_->configuration())
       throw std::invalid_argument("Rocket Runtime session: " + session_->configuration().message);
@@ -173,6 +186,9 @@ public:
     if (!frame.reset && !elf_scope_)
       return fail({CheckStatus::Unsupported, 0,
           "Rocket whole-boot checking requires independent ROM state and the shared trap/interrupt protocol"});
+    const auto mie_check = validate_mie_state(frame);
+    if (!mie_check)
+      return fail(mie_check);
     for (uint32_t hart = 0; hart < decoders_.size(); ++hart) {
       RocketDecodedFrame ready;
       const auto decoded = decoders_[hart]->decode(frame, ready);
@@ -246,6 +262,13 @@ private:
   std::unique_ptr<rvwmo::HostSession> session_;
   std::vector<std::unique_ptr<RocketNativeDecoder>> decoders_;
   std::vector<std::set<unsigned>> initialized_dependencies_;
+  struct MieFields {
+    NativeField value;
+    NativeField retirement_valid;
+    NativeField retirement_pc;
+  };
+  std::vector<MieFields> mie_fields_;
+  std::unique_ptr<RocketMieContract> mie_contract_;
   std::vector<uint64_t> publication_sequences_;
   RocketTerminalProgramContract terminal_contract_;
   std::unique_ptr<RocketTerminalObserver> terminal_observer_;
@@ -299,6 +322,11 @@ private:
   }
 
   CheckResult complete_terminal_session() {
+    if (mie_contract_) {
+      const auto mie = mie_contract_->complete();
+      if (!mie)
+        return mie;
+    }
     if (!terminal_observer_->ready(cycle_) || !signature_store_uid_ || !tohost_store_uid_)
       return {CheckStatus::Incomplete, 0,
               "Rocket WFI terminal, successful REF signature/tohost, or stable quiescence evidence is incomplete"};
@@ -418,6 +446,30 @@ private:
       staged_retirements_.erase(id);
     submitted_prefix_ = through;
     return submitted.check;
+  }
+
+  CheckResult validate_mie_state(const NativeFrame &frame) {
+    if (!mie_contract_)
+      return {};
+    if (frame.samples.size() != mie_fields_.size())
+      return {CheckStatus::Invalid, 0, "Rocket MIE evidence has an incomplete observed hart roster"};
+    std::vector<RocketMieObservation> observations;
+    observations.reserve(mie_fields_.size());
+    for (uint32_t hart = 0; hart < mie_fields_.size(); ++hart) {
+      const auto &sample = frame.samples[hart];
+      if (sample.layout != find_native_layout(1, hart))
+        return {CheckStatus::Invalid, 0, "Rocket MIE observation names a mismatched hart layout"};
+      const auto &fields = mie_fields_[hart];
+      observations.push_back({fields.value.read(sample), fields.retirement_valid.read(sample) &&
+          fields.retirement_pc.read(sample) == UINT64_C(0x80000040)});
+    }
+    const auto result = mie_contract_->observe(frame.reset, observations);
+    if (!result)
+      return result;
+    for (uint32_t hart = 0; hart < mie_fields_.size(); ++hart)
+      if (mie_contract_->entered(hart))
+        initialized_dependencies_[hart].insert(64 + 0x304);
+    return {};
   }
 
   CheckResult validate_entry_registers(const std::vector<rvwmo::ArchitecturalRetirement> &retirements) {
