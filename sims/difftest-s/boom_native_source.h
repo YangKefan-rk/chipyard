@@ -20,6 +20,10 @@ struct BoomNativeSourceConfiguration {
   // instructions preceding this selected scope are counted as uncovered.
   std::vector<uint64_t> entry_pcs;
   uint64_t terminal_pc = 0;
+  // Match the independently initialized GlobalMem window; non-RAM accesses
+  // need a separate MMIO protocol and must not enter scalar LocalStore.
+  uint64_t checked_ram_base = 0;
+  uint64_t checked_ram_size = 0;
   rvwmo::boom::AdapterLimits limits;
   size_t staged_events = 65536;
 };

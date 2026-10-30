@@ -110,6 +110,8 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame) {
       config.initial_cycle = frame.cycle;
       config.limits = configuration_.limits;
       config.staged_events = configuration_.staged_events;
+      config.checked_ram_base = configuration_.checked_ram_base;
+      config.checked_ram_size = configuration_.checked_ram_size;
       collectors_[hart] = std::make_unique<boom::NativeCollector>(config);
     }
     if (!entry_uids_[hart]) {

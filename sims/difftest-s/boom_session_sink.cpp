@@ -80,6 +80,8 @@ public:
     }
     BoomNativeSourceConfiguration source_config;
     source_config.terminal_pc = terminal_pc_;
+    source_config.checked_ram_base = ram_base;
+    source_config.checked_ram_size = ram_size;
     source_config.entry_pcs.assign(layout->harts, entry);
     // Exact native Small BOOM V4 profile: ROB32/LDQ8/STQ8. Other configurations
     // require their real capacity metadata rather than the adapter maximums.
