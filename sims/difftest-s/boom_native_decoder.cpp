@@ -143,6 +143,35 @@ struct StoreFields : RecordFields {
   }
 };
 
+struct DeviceStoreFields : RecordFields {
+  NativeField source_id, address, word, mask, size, tl_data, tl_mask, denied, corrupt;
+  DeviceStoreFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), source_id(fields.field(path + ".bits.source_id")),
+        address(fields.field(path + ".bits.address")), word(fields.field(path + ".bits.word")),
+        mask(fields.field(path + ".bits.byte_mask")), size(fields.field(path + ".bits.mem_size")),
+        tl_data(fields.field(path + ".bits.tl_data")), tl_mask(fields.field(path + ".bits.tl_mask")),
+        denied(fields.field(path + ".bits.denied")), corrupt(fields.field(path + ".bits.corrupt")) {}
+  BoomDeviceStoreFact read(const Sample &sample, uint64_t source_cycle, bool request) const {
+    require_current(sample, source_cycle);
+    BoomDeviceStoreFact result;
+    result.request = request;
+    result.identity = identity.read(sample);
+    result.source_cycle = cycle.read(sample);
+    result.tl_source = static_cast<uint32_t>(source_id.read(sample));
+    result.address = address.read(sample);
+    result.word = word.read(sample);
+    result.byte_mask = static_cast<uint8_t>(mask.read(sample));
+    result.mem_size = static_cast<uint8_t>(size.read(sample));
+    result.tl_data = tl_data.read(sample);
+    result.tl_mask = static_cast<uint8_t>(tl_mask.read(sample));
+    result.denied = denied.read(sample);
+    result.corrupt = corrupt.read(sample);
+    if (!result.identity.uid || !result.identity.epoch || (request && (result.denied || result.corrupt)))
+      throw std::invalid_argument("BOOM MMIO probe has missing identity or impossible TL A status");
+    return result;
+  }
+};
+
 struct WfiParkFields {
   NativeField valid, cycle, csr_wait, rob_only_entry, interrupt_pending, writeback_active;
   NativeField marker_pc, marker_instruction, marker_architectural;
@@ -226,6 +255,7 @@ struct BoomNativeDecoder::Fields {
   NativeField terminal_writeback, terminal_interrupt, terminal_cycle, marker_cycle, marker_pc, marker_instruction;
   IdentityFields marker_identity;
   std::optional<WfiParkFields> wfi;
+  std::vector<DeviceStoreFields> mmio_requests, mmio_acks;
 
   Fields(const NativeProbeLayout &source, BoomPublicationSource publications)
       : layout(&source), publication_source(std::move(publications)), metadata(source),
@@ -254,6 +284,16 @@ struct BoomNativeDecoder::Fields {
         marker_identity(metadata, "core.terminal.marker.identity") {
     if (metadata.has_field("core.wfi_park.valid"))
       wfi.emplace(metadata, "core.wfi_park");
+    const bool requests = metadata.has_field("cache.mmio_request[0].valid");
+    const bool acknowledgments = metadata.has_field("cache.mmio_ack[0].valid");
+    if (requests != acknowledgments)
+      throw std::invalid_argument("BOOM MMIO probe lacks either its TL A or D vector");
+    if (requests) {
+      mmio_requests = vector_fields<DeviceStoreFields>(metadata, "cache.mmio_request");
+      mmio_acks = vector_fields<DeviceStoreFields>(metadata, "cache.mmio_ack");
+      if (mmio_requests.size() != mmio_acks.size())
+        throw std::invalid_argument("BOOM MMIO probe source roster differs between TL A and D");
+    }
     if (source.kind != 2 || !publication_source)
       throw std::invalid_argument("BOOM native decoder requires BOOM metadata and a fabric source allocator");
     for (size_t lane = 0; lane < retired_load.size(); ++lane)
@@ -353,6 +393,28 @@ rvwmo::CheckResult BoomNativeDecoder::wfi_park(const NativeFrame &source, BoomWf
     if (!fields_->wfi)
       return {}; // Missing hardware witness remains unavailable to the host.
     output = fields_->wfi->read(source.samples.at(fields_->layout->hart), source.source_cycle);
+    return {};
+  } catch (const std::exception &error) {
+    return {rvwmo::CheckStatus::Invalid, 0, error.what()};
+  }
+}
+rvwmo::CheckResult BoomNativeDecoder::device_stores(const NativeFrame &source,
+    std::vector<BoomDeviceStoreFact> &output, bool &probe_available) const {
+  try {
+    std::vector<BoomDeviceStoreFact> decoded;
+    probe_available = !fields_->mmio_requests.empty();
+    if (!probe_available) {
+      output.clear();
+      return {}; // Old RTL lacks this witness; never claim an MMIO audit.
+    }
+    const auto &sample = source.samples.at(fields_->layout->hart);
+    for (const auto &record : fields_->mmio_requests)
+      if (record.valid.read(sample))
+        decoded.push_back(record.read(sample, source.source_cycle, true));
+    for (const auto &record : fields_->mmio_acks)
+      if (record.valid.read(sample))
+        decoded.push_back(record.read(sample, source.source_cycle, false));
+    output = std::move(decoded);
     return {};
   } catch (const std::exception &error) {
     return {rvwmo::CheckStatus::Invalid, 0, error.what()};

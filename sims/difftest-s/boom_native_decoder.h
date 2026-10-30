@@ -31,6 +31,17 @@ struct BoomWfiParkFacts {
   uint32_t marker_instruction = 0;
 };
 
+// BOOM IOMSHR TL A/D facts are separate from L1 RAM StorePublish. A request
+// alone cannot certify a completed device effect or a successful REF step.
+struct BoomDeviceStoreFact {
+  bool request = false;
+  rvwmo::boom::ProbeIdentity identity;
+  uint64_t source_cycle = 0, address = 0, word = 0, tl_data = 0;
+  uint32_t tl_source = 0;
+  uint8_t byte_mask = 0, mem_size = 0, tl_mask = 0;
+  bool denied = false, corrupt = false;
+};
+
 class BoomNativeDecoder {
 public:
   BoomNativeDecoder(const NativeProbeLayout &layout, BoomPublicationSource publication_source);
@@ -39,6 +50,8 @@ public:
 
   rvwmo::CheckResult terminal(const NativeFrame &source, BoomTerminalFacts &output) const;
   rvwmo::CheckResult wfi_park(const NativeFrame &source, BoomWfiParkFacts &output) const;
+  rvwmo::CheckResult device_stores(const NativeFrame &source, std::vector<BoomDeviceStoreFact> &output,
+                                   bool &probe_available) const;
 
 private:
   struct Fields;
