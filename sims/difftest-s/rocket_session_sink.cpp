@@ -1,4 +1,5 @@
 #include "rocket_native_decoder.h"
+#include "rocket_hartbreaker_bootstrap.h"
 #include "rvwmo/dependency.h"
 #include "rvwmo/host_session.h"
 #include "rvwmo/memory_image.h"
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <set>
 #include <optional>
 #include <charconv>
 #include <cstdio>
@@ -72,11 +74,15 @@ public:
     const auto ram_base = configured_number("DIFFTEST_S_RAM_BASE", UINT64_C(0x80000000));
     const auto ram_size = configured_number("DIFFTEST_S_RAM_SIZE", UINT64_C(0x10000000));
     const auto scoped = configured_number("DIFFTEST_S_START_AT_ELF", 0);
+    const auto hartbreaker_bootstrap = configured_number("DIFFTEST_S_HARTBREAKER_BOOTSTRAP", 0);
     terminal_contract_ = terminal_program_contract();
     if (scoped > 1 || !ram_size || ram_size > UINT64_C(0x100000000) || !memory_.initialize(ram_base, ram_size))
       throw std::invalid_argument("Rocket Runtime sink requires bounded initialized RAM and an explicit scope");
     if (terminal_contract_.enabled() && !scoped)
       throw std::invalid_argument("Rocket WFI terminal checking requires an explicit ELF-entry scope");
+    if (hartbreaker_bootstrap > 1 || (hartbreaker_bootstrap && (!scoped || layout->harts != 4)))
+      throw std::invalid_argument("Rocket HartBreaker bootstrap requires four harts and explicit ELF-entry scope");
+    hartbreaker_bootstrap_enabled_ = hartbreaker_bootstrap == 1;
     uint64_t entry = 0;
     auto loaded = rvwmo::load_reference_elf(memory_, elf, entry);
     if (!loaded)
@@ -92,11 +98,15 @@ public:
     config.platform = "rocket";
     config.reference_profile = DIFFTEST_REF_PROFILE_ID_ROCKET_CHIP;
     elf_scope_ = scoped;
-    if (scoped)
+    if (hartbreaker_bootstrap)
+      config.verification_scope =
+          "HartBreaker ELF after ELF-byte-verified timer-disable prefix; execution of prefix CLINT MMIO and ROM "
+          "is uncovered; M-mode scalar cached RAM only";
+    else if (scoped)
       config.verification_scope =
           "ELF-entry M-mode scalar cached RAM; ROM/bootstrap CSR/MMIO/interrupts are uncovered";
     config.initial_harts.resize(layout->harts);
-    initialized_registers_.resize(layout->harts);
+    initialized_dependencies_.resize(layout->harts);
     publication_sequences_.resize(layout->harts);
     source_prefixes_.resize(layout->harts * 2);
     terminal_facts_.resize(layout->harts);
@@ -115,9 +125,19 @@ public:
       auto &initial = config.initial_harts[hart];
       initial.pc = entry;
       initial.privilege = 3;
-      // Every other GPR must be established by independent REF execution before
-      // use. In particular, mhartid is read by Spike rather than copied from DUT.
-      initialized_registers_[hart][0] = true;
+      // The optional HartBreaker profile excludes exactly its proven CLINT
+      // timer-disable prefix; no DUT registers or data seed this checkpoint.
+      if (hartbreaker_bootstrap) {
+        const auto checkpoint = hartbreaker_bootstrap_checkpoint(memory_, entry, hart);
+        initial.pc = checkpoint.pc;
+        std::copy(checkpoint.gpr.begin(), checkpoint.gpr.end(), initial.gpr);
+        for (unsigned unit = 0; unit < checkpoint.initialized.size(); ++unit)
+          if (checkpoint.initialized[unit])
+            initialized_dependencies_[hart].insert(unit);
+      } else {
+        // Except x0, GPRs must be established by independent REF execution.
+        initialized_dependencies_[hart].insert(0);
+      }
       const auto producer = rvwmo::hart_producer_id(hart);
       const auto fabric = rvwmo::memory_fabric_producer_id(hart);
       config.stream.required_producers.push_back({producer, hart_kinds});
@@ -126,7 +146,7 @@ public:
       config.producers.push_back({fabric, true, true, true, {rvwmo::RuntimeEventKind::StorePublish}});
       RocketDecoderConfiguration source_config;
       source_config.publication_producer = fabric;
-      source_config.entry_pc = scoped ? entry : 0;
+      source_config.entry_pc = scoped ? initial.pc : 0;
       source_config.require_terminal_observations = terminal_contract_.enabled();
       decoders_.push_back(std::make_unique<RocketNativeDecoder>(*hart_layout, source_config,
           [this, hart](uint64_t cycle) {
@@ -225,7 +245,7 @@ private:
   GlobalMem memory_;
   std::unique_ptr<rvwmo::HostSession> session_;
   std::vector<std::unique_ptr<RocketNativeDecoder>> decoders_;
-  std::vector<std::array<bool, 32>> initialized_registers_;
+  std::vector<std::set<unsigned>> initialized_dependencies_;
   std::vector<uint64_t> publication_sequences_;
   RocketTerminalProgramContract terminal_contract_;
   std::unique_ptr<RocketTerminalObserver> terminal_observer_;
@@ -244,6 +264,7 @@ private:
   CheckResult failure_, final_result_;
   bool finalized_ = false;
   bool elf_scope_ = false;
+  bool hartbreaker_bootstrap_enabled_ = false;
 
   rvwmo::CheckResult observe_reference_store(const rvwmo::ReferenceStoreValue &store) {
     if (store.id.hart != 0 || store.bytes.size() != sizeof(uint64_t) ||
@@ -401,20 +422,23 @@ private:
 
   CheckResult validate_entry_registers(const std::vector<rvwmo::ArchitecturalRetirement> &retirements) {
     for (const auto &retirement : retirements) {
-      if (retirement.id.hart >= initialized_registers_.size())
+      if (retirement.id.hart >= initialized_dependencies_.size())
         return {CheckStatus::Invalid, 0, "Rocket entry-state validation names an unknown hart"};
       rvwmo::DependencyMetadata dependencies;
       auto result = rvwmo::decode_dependencies(retirement.instruction, dependencies);
       if (!result)
         return result;
-      auto &initialized = initialized_registers_[retirement.id.hart];
-      for (const auto reg : dependencies.sources)
-        if (reg >= initialized.size() || !initialized[reg])
-          return {CheckStatus::Unsupported, 0,
-                  "Rocket entry program reads a register outside its independently initialized state"};
-      for (const auto reg : dependencies.destinations)
-        if (reg < initialized.size())
-          initialized[reg] = true;
+      auto &initialized = initialized_dependencies_[retirement.id.hart];
+      for (const auto unit : dependencies.sources) {
+        if ((!hartbreaker_bootstrap_enabled_ && unit >= 32) || (unit && !initialized.count(unit)))
+          return {CheckStatus::Unsupported, 0, hartbreaker_bootstrap_enabled_
+                  ? "Rocket entry PC " + std::to_string(retirement.pc) +
+                    " reads uninitialized dependency unit " + std::to_string(unit)
+                  : "Rocket entry program reads a register outside its independently initialized state"};
+      }
+      for (const auto unit : dependencies.destinations)
+        if (unit && (hartbreaker_bootstrap_enabled_ || unit < 32))
+          initialized.insert(unit);
     }
     return {};
   }

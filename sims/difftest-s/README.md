@@ -147,6 +147,22 @@ initialized scalar-RAM prefix, not full ISA or full RVWMO completeness. Generic
 AMO/LRSC, FP/vector, split accesses, MMIO, traps and interrupts are outside this
 acceptance scope.
 
+### Optional HartBreaker entry checkpoint
+
+`DIFFTEST_S_HARTBREAKER_BOOTSTRAP=1` is an opt-in four-hart profile used with
+`DIFFTEST_S_START_AT_ELF=1`. It admits only the 16 exact instructions of the
+HartBreaker quadrocket timer-disable entry, verifies their bytes in the
+independently loaded ELF, computes the four-hart GPR checkpoint without DUT
+load results, and starts REF/retirement checks at `0x80000040`. The CLINT MMIO
+write and execution of that excluded prefix remain **outside** the checked
+scope. A changed prefix, unknown entry, or unknown hart is rejected.
+
+This option does not enable arbitrary HartBreaker ELFs: uninitialized CSR
+dependencies, FP, AMO/LRSC, and HartBreaker's native terminal behavior still
+need independent modeling. A successful prefix checkpoint is not a Difftest-S
+Pass; an unsupported suffix remains `Unsupported` or `Incomplete`. The default
+profile and terminal contract are unchanged when the option is unset.
+
 ## Observation transport
 
 Generated `difftest-s-layout-*.json` files describe packed native probe fields.
