@@ -151,19 +151,27 @@ public:
     if (frame.reset)
       return result;
     cycle_ = frame.source_cycle;
+    if (result && tohost_address_)
+      result = observe_parked_wfi();
     if (result) {
       rvwmo::boom::CollectedObservations ready;
       result = source_->take_ready(ready);
       if (result)
         result = validate_entry_registers(ready.retirements);
+      // A delayed architectural event from before parking may arrive in a
+      // later native batch. Reject only effects sourced at or after the WFI
+      // stall, not an earlier retirement still awaiting its load evidence.
       if (result && tohost_address_)
-        for (const auto &retirement : ready.retirements) {
-          if (retirement.id.hart >= parked_harts_.size()) {
+        for (const auto &event : ready.batch.events) {
+          if (event.kind != rvwmo::RuntimeEventKind::InstructionRetire)
+            continue;
+          const auto hart = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction.hart;
+          if (hart >= parked_harts_.size()) {
             result = {CheckStatus::Invalid, 0, "HartBreaker retirement names an unknown hart"};
             break;
           }
-          if (parked_harts_[retirement.id.hart]) {
-            result = {CheckStatus::Incomplete, 0, "HartBreaker hart retired after its WFI parking marker"};
+          if (parked_harts_[hart] && event.source.cycle >= parked_harts_[hart]->source_cycle) {
+            result = {CheckStatus::Incomplete, 0, "HartBreaker hart retired at or after its physical WFI stall"};
             break;
           }
         }
@@ -183,8 +191,6 @@ public:
                 continue;
               if (terminal_pc_ && snapshot.pc == terminal_pc_ && snapshot.instruction == 0x0000100f)
                 submitted_markers_[instruction.hart] = SubmittedTerminalMarker{snapshot.id, event.source.cycle};
-              if (tohost_address_ && snapshot.pc == parked_wfi_pc_ && snapshot.instruction == 0x10500073)
-                parked_harts_[instruction.hart] = SubmittedTerminalMarker{snapshot.id, event.source.cycle};
             }
           }
       }
@@ -256,7 +262,38 @@ private:
   bool completed_ = false;
   struct SubmittedTerminalMarker { rvwmo::OperationId id; uint64_t source_cycle; };
   std::vector<std::optional<SubmittedTerminalMarker>> submitted_markers_;
-  std::vector<std::optional<SubmittedTerminalMarker>> parked_harts_;
+  struct ParkedWfiObservation {
+    rvwmo::OperationId id;
+    uint64_t rob_generation = 0;
+    uint64_t source_cycle = 0;
+  };
+  std::vector<std::optional<ParkedWfiObservation>> parked_harts_;
+
+  CheckResult observe_parked_wfi() {
+    const auto &facts = source_->wfi_park_facts();
+    if (facts.size() != parked_harts_.size())
+      return {CheckStatus::Invalid, 0, "HartBreaker WFI roster differs from four-hart REF"};
+    for (uint32_t hart = 0; hart < facts.size(); ++hart) {
+      const auto &park = facts[hart];
+      if (!park.available) {
+        if (parked_harts_[hart])
+          return {CheckStatus::Incomplete, 0, "HartBreaker WFI hardware witness disappeared"};
+        continue; // Old RTL cannot prove parking; finalization remains Incomplete.
+      }
+      if (parked_harts_[hart] && (!park.valid || park.marker.uid != parked_harts_[hart]->id.uid ||
+                                  park.marker.epoch != parked_harts_[hart]->id.epoch ||
+                                  park.marker.rob_generation != parked_harts_[hart]->rob_generation))
+        return {CheckStatus::Incomplete, 0, "HartBreaker parked WFI woke or changed its ROB identity"};
+      if (!park.valid)
+        continue;
+      if (park.marker_pc != parked_wfi_pc_ || park.marker_instruction != 0x10500073)
+        return {CheckStatus::Invalid, 0, "BOOM physical WFI does not match the independent ELF parking loop"};
+      if (!parked_harts_[hart])
+        parked_harts_[hart] = ParkedWfiObservation{{hart, park.marker.epoch, park.marker.uid, 0},
+                                                    park.marker.rob_generation, park.source_cycle};
+    }
+    return {};
+  }
   std::vector<std::array<bool, 32>> initialized_registers_;
 
   CheckResult complete_terminal() {

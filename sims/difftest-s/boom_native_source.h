@@ -40,6 +40,7 @@ public:
   rvwmo::CheckResult audit_reference_store(const rvwmo::ReferenceStoreValue &store);
   rvwmo::CheckResult completion() const;
   const std::vector<BoomTerminalFacts> &terminal_facts() const { return terminal_facts_; }
+  const std::vector<BoomWfiParkFacts> &wfi_park_facts() const { return wfi_park_facts_; }
   const std::vector<UncheckedBootstrap> &unchecked_bootstrap() const { return bootstrap_; }
 
 private:
@@ -50,6 +51,7 @@ private:
   std::vector<uint64_t> watermarks_;
   std::vector<UncheckedBootstrap> bootstrap_;
   std::vector<BoomTerminalFacts> terminal_facts_;
+  std::vector<BoomWfiParkFacts> wfi_park_facts_;
   std::vector<std::optional<rvwmo::boom::ProbeInstruction>> terminal_retirements_;
   std::vector<uint64_t> terminal_retirement_cycles_;
   std::vector<rvwmo::RuntimeEvent> events_;

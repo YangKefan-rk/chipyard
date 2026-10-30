@@ -20,6 +20,17 @@ struct BoomTerminalFacts {
   uint32_t marker_instruction = 0;
 };
 
+struct BoomWfiParkFacts {
+  // Legacy RTL layouts do not carry a WFI parking probe; absence cannot be
+  // interpreted as an unretired architectural completion.
+  bool available = false, valid = false;
+  bool csr_wait = false, rob_only_entry = false;
+  bool interrupt_pending = false, writeback_active = false;
+  uint64_t source_cycle = 0, marker_pc = 0;
+  rvwmo::boom::ProbeIdentity marker;
+  uint32_t marker_instruction = 0;
+};
+
 class BoomNativeDecoder {
 public:
   BoomNativeDecoder(const NativeProbeLayout &layout, BoomPublicationSource publication_source);
@@ -27,6 +38,7 @@ public:
   rvwmo::CheckResult decode(const NativeFrame &source, rvwmo::boom::NativeFrame &output) const;
 
   rvwmo::CheckResult terminal(const NativeFrame &source, BoomTerminalFacts &output) const;
+  rvwmo::CheckResult wfi_park(const NativeFrame &source, BoomWfiParkFacts &output) const;
 
 private:
   struct Fields;

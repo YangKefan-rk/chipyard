@@ -42,7 +42,8 @@ void select_entry_scope(boom::NativeFrame &frame, uint64_t entry_uid) {
 BoomNativeSource::BoomNativeSource(BoomNativeSourceConfiguration configuration)
     : configuration_(std::move(configuration)), collectors_(configuration_.entry_pcs.size()),
       entry_uids_(collectors_.size()), watermarks_(collectors_.size()), bootstrap_(collectors_.size()),
-      terminal_facts_(collectors_.size()), terminal_retirements_(collectors_.size()),
+      terminal_facts_(collectors_.size()), wfi_park_facts_(collectors_.size()),
+      terminal_retirements_(collectors_.size()),
       terminal_retirement_cycles_(collectors_.size()) {
   if (!configuration_.epoch || collectors_.empty() || collectors_.size() > 256 || !configuration_.staged_events)
     throw std::invalid_argument("BOOM native source requires a bounded hart roster, epoch and staging limit");
@@ -79,6 +80,8 @@ CheckResult BoomNativeSource::capture(const NativeFrame &frame) {
     auto result = decoders_[hart]->decode(frame, decoded);
     if (result)
       result = decoders_[hart]->terminal(frame, terminal_facts_[hart]);
+    if (result)
+      result = decoders_[hart]->wfi_park(frame, wfi_park_facts_[hart]);
     if (!result || !(result = capture_hart(std::move(decoded))))
       return remember_failure(result);
   }

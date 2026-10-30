@@ -143,6 +143,41 @@ struct StoreFields : RecordFields {
   }
 };
 
+struct WfiParkFields {
+  NativeField valid, cycle, csr_wait, rob_only_entry, interrupt_pending, writeback_active;
+  NativeField marker_pc, marker_instruction, marker_architectural;
+  IdentityFields marker_identity;
+  WfiParkFields(const NativeFields &fields, const std::string &path)
+      : valid(fields.field(path + ".valid")), cycle(fields.field(path + ".source_cycle")),
+        csr_wait(fields.field(path + ".csr_wait")), rob_only_entry(fields.field(path + ".rob_only_entry")),
+        interrupt_pending(fields.field(path + ".interrupt_pending")),
+        writeback_active(fields.field(path + ".writeback_active")),
+        marker_pc(fields.field(path + ".marker.pc")),
+        marker_instruction(fields.field(path + ".marker.instruction")),
+        marker_architectural(fields.field(path + ".marker.architectural")),
+        marker_identity(fields, path + ".marker.identity") {}
+  BoomWfiParkFacts read(const Sample &sample, uint64_t source_cycle) const {
+    BoomWfiParkFacts result;
+    result.available = true;
+    result.valid = valid.read(sample);
+    if (!result.valid)
+      return result;
+    result.source_cycle = cycle.read(sample);
+    result.csr_wait = csr_wait.read(sample);
+    result.rob_only_entry = rob_only_entry.read(sample);
+    result.interrupt_pending = interrupt_pending.read(sample);
+    result.writeback_active = writeback_active.read(sample);
+    result.marker = marker_identity.read(sample);
+    result.marker_pc = marker_pc.read(sample);
+    result.marker_instruction = static_cast<uint32_t>(marker_instruction.read(sample));
+    if (result.source_cycle != source_cycle || !result.marker.uid || result.marker_pc % 2 ||
+        result.marker_instruction != 0x10500073 || marker_architectural.read(sample) ||
+        !result.csr_wait || !result.rob_only_entry || result.interrupt_pending || result.writeback_active)
+      throw std::invalid_argument("BOOM WFI park lacks a live unretired unique ROB/CSR-stall witness");
+    return result;
+  }
+};
+
 struct SquashFields : RecordFields {
   NativeField rob;
   SquashFields(const NativeFields &fields, const std::string &path)
@@ -190,6 +225,7 @@ struct BoomNativeDecoder::Fields {
   NativeField terminal_armed, terminal_pc, terminal_reached, terminal_stopped, terminal_empty;
   NativeField terminal_writeback, terminal_interrupt, terminal_cycle, marker_cycle, marker_pc, marker_instruction;
   IdentityFields marker_identity;
+  std::optional<WfiParkFields> wfi;
 
   Fields(const NativeProbeLayout &source, BoomPublicationSource publications)
       : layout(&source), publication_source(std::move(publications)), metadata(source),
@@ -216,6 +252,8 @@ struct BoomNativeDecoder::Fields {
         marker_pc(metadata.field("core.terminal.marker.pc")),
         marker_instruction(metadata.field("core.terminal.marker.instruction")),
         marker_identity(metadata, "core.terminal.marker.identity") {
+    if (metadata.has_field("core.wfi_park.valid"))
+      wfi.emplace(metadata, "core.wfi_park");
     if (source.kind != 2 || !publication_source)
       throw std::invalid_argument("BOOM native decoder requires BOOM metadata and a fabric source allocator");
     for (size_t lane = 0; lane < retired_load.size(); ++lane)
@@ -304,6 +342,17 @@ rvwmo::CheckResult BoomNativeDecoder::terminal(const NativeFrame &source, BoomTe
       static_cast<uint32_t>(fields_->marker_instruction.read(sample))};
     if (output.source_cycle != source.source_cycle)
       return {rvwmo::CheckStatus::Invalid, 0, "BOOM terminal facts differ from the actual source edge"};
+    return {};
+  } catch (const std::exception &error) {
+    return {rvwmo::CheckStatus::Invalid, 0, error.what()};
+  }
+}
+rvwmo::CheckResult BoomNativeDecoder::wfi_park(const NativeFrame &source, BoomWfiParkFacts &output) const {
+  try {
+    output = {};
+    if (!fields_->wfi)
+      return {}; // Missing hardware witness remains unavailable to the host.
+    output = fields_->wfi->read(source.samples.at(fields_->layout->hart), source.source_cycle);
     return {};
   } catch (const std::exception &error) {
     return {rvwmo::CheckStatus::Invalid, 0, error.what()};

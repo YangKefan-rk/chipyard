@@ -54,6 +54,8 @@ public:
       throw std::invalid_argument("native field metadata does not cover its declared payload");
   }
 
+  bool has_field(std::string_view path) const { return fields_.find(path) != fields_.end(); }
+
   NativeField field(std::string_view path) const {
     const auto found = fields_.find(path);
     if (found == fields_.end())
