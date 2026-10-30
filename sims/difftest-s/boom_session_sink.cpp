@@ -227,9 +227,11 @@ public:
     for (uint32_t hart = 0; hart < source_->unchecked_bootstrap().size(); ++hart) {
       const auto &outside = source_->unchecked_bootstrap()[hart];
       std::fprintf(stderr,
-        "DIFFTEST-S uncovered bootstrap hart %u: instructions=%llu loads=%llu stores=%llu traps=%llu\n",
+        "DIFFTEST-S uncovered bootstrap hart %u: instructions=%llu loads=%llu stores=%llu traps=%llu mmio_requests=%llu mmio_acks=%llu\n",
         hart, static_cast<unsigned long long>(outside.instructions), static_cast<unsigned long long>(outside.loads),
-        static_cast<unsigned long long>(outside.stores), static_cast<unsigned long long>(outside.traps));
+        static_cast<unsigned long long>(outside.stores), static_cast<unsigned long long>(outside.traps),
+        static_cast<unsigned long long>(outside.mmio_store_requests),
+        static_cast<unsigned long long>(outside.mmio_store_acks));
     }
     // Native HTIF may call $finish on the first tohost publication. HartBreaker
     // keeps the winning hart in a repeated store/jump loop; that alone cannot
@@ -275,6 +277,16 @@ private:
       return {CheckStatus::Invalid, 0, "HartBreaker WFI roster differs from four-hart REF"};
     for (uint32_t hart = 0; hart < facts.size(); ++hart) {
       const auto &park = facts[hart];
+      const uint64_t entry_uid = source_->entry_uid(hart);
+      // BootROM contains its own WFI but is explicitly outside the checked
+      // ELF-entry scope. A later delivery is classified by stable UID.
+      if (!entry_uid)
+        continue;
+      if (park.valid && park.marker.uid < entry_uid) {
+        if (parked_harts_[hart])
+          return {CheckStatus::Incomplete, 0, "HartBreaker parked WFI switched back to a BootROM owner"};
+        continue;
+      }
       if (!park.available) {
         if (parked_harts_[hart])
           return {CheckStatus::Incomplete, 0, "HartBreaker WFI hardware witness disappeared"};

@@ -88,22 +88,17 @@ CheckResult BoomNativeSource::capture(const NativeFrame &frame) {
       result = decoders_[hart]->device_stores(frame, device_events, device_probe_available);
     if (!result)
       return remember_failure(result);
-    // TL A acceptance and a TL D ACK are not a RAM StorePublish or a REF
-    // device audit. An observed effect must remain Unsupported until the
-    // independent Spike MMIO trace and this exact UID/data are correlated.
     if (!device_probe_available && !device_events.empty())
       return remember_failure(invalid("BOOM MMIO event has no complete physical probe layout"));
-    if (!device_events.empty())
-      return remember_failure({CheckStatus::Unsupported, 0,
-          "BOOM uncached TL store awaits independent REF MMIO/device audit"});
-    if (!(result = capture_hart(std::move(decoded))))
+    if (!(result = capture_hart(std::move(decoded), device_events)))
       return remember_failure(result);
   }
   captured_cycle_ = frame.source_cycle;
   return {};
 }
 
-CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame) {
+CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
+                                           const std::vector<BoomDeviceStoreFact> &device_events) {
   const auto hart = frame.hart;
   if (!entry_uids_[hart]) {
     auto &outside = bootstrap_[hart];
@@ -132,9 +127,31 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame) {
       collectors_[hart] = std::make_unique<boom::NativeCollector>(config);
     }
     if (!entry_uids_[hart]) {
+      for (const auto &device : device_events) {
+        if (device.request)
+          ++outside.mmio_store_requests;
+        else
+          ++outside.mmio_store_acks;
+      }
       watermarks_[hart] = frame.cycle;
       return {};
     }
+  }
+  for (const auto &device : device_events) {
+    if (device.identity.uid < entry_uids_[hart]) {
+      // BOOTROM MMIO is explicitly outside the independently initialized
+      // DRAM-entry scope. Track late ACKs by UID, not by their delivery time.
+      if (device.request)
+        ++bootstrap_[hart].mmio_store_requests;
+      else
+        ++bootstrap_[hart].mmio_store_acks;
+      continue;
+    }
+    // TL A acceptance and a TL D ACK are not a RAM StorePublish or a REF
+    // device audit. Every in-scope MMIO effect still requires an independent
+    // REF trace matched to the exact retired UID, physical bytes and ACK.
+    return {CheckStatus::Unsupported, 0,
+            "BOOM uncached TL store awaits independent REF MMIO/device audit"};
   }
   select_entry_scope(frame, entry_uids_[hart]);
   if (configuration_.terminal_pc) {

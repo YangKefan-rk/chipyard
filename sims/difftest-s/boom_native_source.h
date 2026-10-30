@@ -12,6 +12,8 @@ struct UncheckedBootstrap {
   uint64_t loads = 0;
   uint64_t stores = 0;
   uint64_t traps = 0;
+  uint64_t mmio_store_requests = 0;
+  uint64_t mmio_store_acks = 0;
 };
 
 struct BoomNativeSourceConfiguration {
@@ -42,6 +44,7 @@ public:
   const std::vector<BoomTerminalFacts> &terminal_facts() const { return terminal_facts_; }
   const std::vector<BoomWfiParkFacts> &wfi_park_facts() const { return wfi_park_facts_; }
   const std::vector<UncheckedBootstrap> &unchecked_bootstrap() const { return bootstrap_; }
+  uint64_t entry_uid(uint32_t hart) const { return hart < entry_uids_.size() ? entry_uids_[hart] : 0; }
 
 private:
   BoomNativeSourceConfiguration configuration_;
@@ -62,7 +65,8 @@ private:
   uint64_t emitted_publication_sequence_ = 0;
   rvwmo::CheckResult failure_;
 
-  rvwmo::CheckResult capture_hart(rvwmo::boom::NativeFrame frame);
+  rvwmo::CheckResult capture_hart(rvwmo::boom::NativeFrame frame,
+                                 const std::vector<BoomDeviceStoreFact> &device_events);
   rvwmo::CheckResult remember_failure(rvwmo::CheckResult result);
 };
 
