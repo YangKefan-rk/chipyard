@@ -1,4 +1,5 @@
 #include "boom_native_source.h"
+#include "boom_hartbreaker_elf.h"
 #include "rvwmo/host_session.h"
 #include "rvwmo/dependency.h"
 #include "rvwmo/memory_image.h"
@@ -6,6 +7,7 @@
 #include <verilated.h>
 #include <charconv>
 #include <array>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -46,7 +48,25 @@ public:
     if (!loaded)
       throw std::invalid_argument("independent reference ELF: " + loaded.message);
 
+    const char *mode = std::getenv("DIFFTEST_S_BOOM_TERMINAL_MODE");
+    if (mode && *mode) {
+      if (std::string(mode) != "hartbreaker-tohost-v1")
+        throw std::invalid_argument("unknown BOOM terminal mode");
+      const char *expected = std::getenv("DIFFTEST_S_BOOM_TOHOST_SUCCESS_VALUE");
+      if (!expected || !*expected)
+        throw std::invalid_argument("HartBreaker terminal needs an independent expected tohost value");
+      tohost_success_value_ = configured_number("DIFFTEST_S_BOOM_TOHOST_SUCCESS_VALUE", 0);
+      if (!tohost_success_value_)
+        throw std::invalid_argument("HartBreaker success tohost value cannot be zero");
+      if (layout->harts != 4)
+        throw std::invalid_argument("HartBreaker terminal requires exactly four native BOOM harts");
+      const auto terminal = resolve_hartbreaker_terminal(elf, memory_);
+      tohost_address_ = terminal.tohost;
+      parked_wfi_pc_ = terminal.parked_wfi;
+    }
     terminal_pc_ = configured_number("DIFFTEST_S_BOOM_TERMINAL_PC", 0);
+    if (tohost_address_ && terminal_pc_)
+      throw std::invalid_argument("HartBreaker and fixed-PC BOOM terminal policies are mutually exclusive");
     if (terminal_pc_) {
       success_address_ = configured_number("DIFFTEST_S_BOOM_SUCCESS_ADDRESS", 0);
       const char *success = std::getenv("DIFFTEST_S_BOOM_SUCCESS_VALUE");
@@ -76,6 +96,7 @@ public:
     config.initial_harts.resize(layout->harts);
     initialized_registers_.resize(layout->harts);
     submitted_markers_.resize(layout->harts);
+    parked_harts_.resize(layout->harts);
     const std::vector<rvwmo::RuntimeEventKind> hart_kinds = {
       rvwmo::RuntimeEventKind::InstructionAllocate, rvwmo::RuntimeEventKind::InstructionRetire,
       rvwmo::RuntimeEventKind::InstructionCancelAttempt, rvwmo::RuntimeEventKind::InstructionSquash,
@@ -97,7 +118,22 @@ public:
       config.producers.push_back({fabric, true, true, true, {rvwmo::RuntimeEventKind::StorePublish}});
     }
     config.reference_store_observer = [this](const rvwmo::ReferenceStoreValue &store) {
-      return source_->audit_reference_store(store);
+      auto result = source_->audit_reference_store(store);
+      if (!result || !tohost_address_ || store.address != tohost_address_)
+        return result;
+      if (store.bytes.size() != 8 || store.byte_mask.size() != 8 ||
+          std::any_of(store.byte_mask.begin(), store.byte_mask.end(), [](uint8_t mask) { return mask != 1; }))
+        return CheckResult{CheckStatus::Unsupported, 0, "HartBreaker tohost requires an audited full-width store"};
+      uint64_t value = 0;
+      for (size_t index = 0; index < store.bytes.size(); ++index)
+        value |= uint64_t(store.bytes[index]) << (index * 8);
+      if (value != tohost_success_value_)
+        return CheckResult{CheckStatus::Violation, 0, "HartBreaker audited REF tohost store has an incorrect exit value"};
+      if (tohost_store_ && tohost_store_->hart != store.id.hart)
+        return CheckResult{CheckStatus::Violation, 0, "HartBreaker has multiple winning tohost harts"};
+      if (!tohost_store_)
+        tohost_store_ = store.id;
+      return result;
     };
     session_ = std::make_unique<rvwmo::HostSession>(memory_, std::move(config));
     if (!session_->configuration())
@@ -116,6 +152,17 @@ public:
       result = source_->take_ready(ready);
       if (result)
         result = validate_entry_registers(ready.retirements);
+      if (result && tohost_address_)
+        for (const auto &retirement : ready.retirements) {
+          if (retirement.id.hart >= parked_harts_.size()) {
+            result = {CheckStatus::Invalid, 0, "HartBreaker retirement names an unknown hart"};
+            break;
+          }
+          if (parked_harts_[retirement.id.hart]) {
+            result = {CheckStatus::Incomplete, 0, "HartBreaker hart retired after its WFI parking marker"};
+            break;
+          }
+        }
       if (result) {
         const auto submitted = session_->submit(ready.batch, ready.retirements);
         result = submitted.check;
@@ -126,11 +173,15 @@ public:
             if (event.kind != rvwmo::RuntimeEventKind::InstructionRetire)
               continue;
             const auto &instruction = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction;
-            for (const auto &snapshot : ready.retirements)
-              if (snapshot.id.hart == instruction.hart && snapshot.id.epoch == instruction.epoch &&
-                  snapshot.id.uid == instruction.uid &&
-                  snapshot.pc == terminal_pc_ && snapshot.instruction == 0x0000100f)
+            for (const auto &snapshot : ready.retirements) {
+              if (snapshot.id.hart != instruction.hart || snapshot.id.epoch != instruction.epoch ||
+                  snapshot.id.uid != instruction.uid)
+                continue;
+              if (terminal_pc_ && snapshot.pc == terminal_pc_ && snapshot.instruction == 0x0000100f)
                 submitted_markers_[instruction.hart] = SubmittedTerminalMarker{snapshot.id, event.source.cycle};
+              if (tohost_address_ && snapshot.pc == parked_wfi_pc_ && snapshot.instruction == 0x10500073)
+                parked_harts_[instruction.hart] = SubmittedTerminalMarker{snapshot.id, event.source.cycle};
+            }
           }
       }
       if (result && terminal_pc_) {
@@ -170,8 +221,19 @@ public:
         hart, static_cast<unsigned long long>(outside.instructions), static_cast<unsigned long long>(outside.loads),
         static_cast<unsigned long long>(outside.stores), static_cast<unsigned long long>(outside.traps));
     }
-    // No completion is inferred from PC loops, elapsed cycles or RAM signatures.
-    // Missing architectural completion and physical drain remain Incomplete.
+    // Native HTIF may call $finish on the first tohost publication. HartBreaker
+    // keeps the winning hart in a repeated store/jump loop; that alone cannot
+    // prove that its younger instructions stopped or all harts physically drain.
+    // Until the RTL supplies that witness, the original ELF cannot be a Pass.
+    if (tohost_address_ && failure_) {
+      const auto parked = std::count_if(parked_harts_.begin(), parked_harts_.end(),
+          [](const auto &marker) { return marker.has_value(); });
+      session_->report_source_failure({CheckStatus::Incomplete, 0,
+          !tohost_store_ ? "HartBreaker has no audited retiring tohost success store" :
+          parked != parked_harts_.size() - 1 || parked_harts_[tohost_store_->hart]
+            ? "HartBreaker winner and three WFI parking boundaries are unproven"
+            : "HartBreaker winner stop and four-hart physical drain are unproven"});
+    }
     auto result = session_->finalize(cycle_);
     std::fprintf(stderr, "DIFFTEST_S_FINAL %s\n", session_->final_report().c_str());
     return failure_ ? result : failure_;
@@ -185,9 +247,12 @@ private:
   CheckResult failure_;
   uint64_t terminal_pc_ = 0;
   uint64_t success_address_ = 0, success_value_ = 0;
+  uint64_t tohost_address_ = 0, tohost_success_value_ = 0, parked_wfi_pc_ = 0;
+  std::optional<rvwmo::OperationId> tohost_store_;
   bool completed_ = false;
   struct SubmittedTerminalMarker { rvwmo::OperationId id; uint64_t source_cycle; };
   std::vector<std::optional<SubmittedTerminalMarker>> submitted_markers_;
+  std::vector<std::optional<SubmittedTerminalMarker>> parked_harts_;
   std::vector<std::array<bool, 32>> initialized_registers_;
 
   CheckResult complete_terminal() {
