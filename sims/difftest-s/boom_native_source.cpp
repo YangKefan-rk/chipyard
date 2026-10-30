@@ -82,7 +82,21 @@ CheckResult BoomNativeSource::capture(const NativeFrame &frame) {
       result = decoders_[hart]->terminal(frame, terminal_facts_[hart]);
     if (result)
       result = decoders_[hart]->wfi_park(frame, wfi_park_facts_[hart]);
-    if (!result || !(result = capture_hart(std::move(decoded))))
+    std::vector<BoomDeviceStoreFact> device_events;
+    bool device_probe_available = false;
+    if (result)
+      result = decoders_[hart]->device_stores(frame, device_events, device_probe_available);
+    if (!result)
+      return remember_failure(result);
+    // TL A acceptance and a TL D ACK are not a RAM StorePublish or a REF
+    // device audit. An observed effect must remain Unsupported until the
+    // independent Spike MMIO trace and this exact UID/data are correlated.
+    if (!device_probe_available && !device_events.empty())
+      return remember_failure(invalid("BOOM MMIO event has no complete physical probe layout"));
+    if (!device_events.empty())
+      return remember_failure({CheckStatus::Unsupported, 0,
+          "BOOM uncached TL store awaits independent REF MMIO/device audit"});
+    if (!(result = capture_hart(std::move(decoded))))
       return remember_failure(result);
   }
   captured_cycle_ = frame.source_cycle;
