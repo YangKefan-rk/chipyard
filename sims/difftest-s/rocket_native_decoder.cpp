@@ -31,6 +31,9 @@ uint8_t narrow_byte(uint64_t value) {
   return static_cast<uint8_t>(value);
 }
 
+// Rocket MemoryOpConstants: SWAP=4, ADD=8, XOR..MAXU=9..15.
+bool amo_command(uint8_t command) { return command == 4 || (command >= 8 && command <= 15); }
+
 struct ValidFields {
   NativeField valid;
   ValidFields(const NativeFields &fields, const std::string &path) : valid(fields.field(path + ".valid")) {
@@ -83,6 +86,22 @@ struct StoreFields : ValidFields {
   }
 };
 
+struct AtomicFields {
+  ValidFields read;
+  AccessFields read_access;
+  NativeField old_raw_data, old_arch_data;
+  StoreFields write;
+
+  explicit AtomicFields(const NativeFields &fields)
+      : read(fields, "cache.atomicRead"), read_access(fields, "cache.atomicRead.bits.access", "requestId"),
+        old_raw_data(fields.field("cache.atomicRead.bits.rawData")),
+        old_arch_data(fields.field("cache.atomicRead.bits.data")), write(fields, "cache.atomicWrite") {
+    if (read_access.id.width != 64 || write.id.width != 64 || old_raw_data.width != 64 ||
+        old_arch_data.width != 64 || write.word.width != 64 || write.mask.width != 8)
+      throw std::invalid_argument("Rocket AMO old/new probe widths are not RV64 scalar");
+  }
+};
+
 struct StoreGroupFields {
   NativeField ecc_bytes, advance, advance_id, advance_maintenance, merge_target, physical_mask, second_slot;
 
@@ -116,6 +135,7 @@ struct Fields {
   NativeField hart, core_requestor, cache_requestors, cache_available;
   std::optional<NativeField> cache_idle;
   std::optional<StoreGroupFields> store_groups;
+  std::optional<AtomicFields> atomic;
   ValidFields allocate, core_request, cache_request, s1_rejected, result, load, drain, retire, late_write, trap;
   InstructionFields allocation, retirement;
   AccessFields core_access, cache_access, result_access, load_access;
@@ -190,6 +210,16 @@ struct Fields {
       throw std::invalid_argument("Rocket native layout has partial store-group observations");
     if (store_group_fields)
       store_groups.emplace(metadata);
+    size_t atomic_field_count = 0;
+    for (size_t index = 0; index < layout.field_count; ++index) {
+      const std::string_view path(layout.fields[index].path);
+      if (path.substr(0, 17) == "cache.atomicRead." || path.substr(0, 18) == "cache.atomicWrite.")
+        ++atomic_field_count;
+    }
+    // Requiring every named field in AtomicFields rejects partial old/new
+    // layouts without constraining future, separately negotiated fields.
+    if (atomic_field_count)
+      atomic.emplace(metadata);
     floating_write = optional_flag("core.retire.bits.floatingPointWrite");
     pending_floating_writeback = optional_flag("core.pendingFloatingPointWriteback");
     if (floating_write) {
@@ -217,6 +247,13 @@ struct Fields {
 } // namespace
 
 struct RocketNativeDecoder::State {
+  struct AtomicObservation {
+    uint64_t old_raw = 0, old_arch = 0, final_word = 0;
+    uint64_t address = 0;
+    uint8_t mask = 0;
+    SourcePosition array_read, computed;
+    std::optional<SourcePosition> physical_drain;
+  };
   struct Instruction {
     rocket::InstructionObservation allocation;
     rvwmo::OperationId id;
@@ -233,6 +270,8 @@ struct RocketNativeDecoder::State {
     bool result_seen = false;
     bool qualified_store = false;
     bool discarded = false;
+    std::optional<SourcePosition> array_read;
+    std::optional<AtomicObservation> atomic;
   };
 
   const NativeProbeLayout *layout;
@@ -438,6 +477,8 @@ struct RocketNativeDecoder::State {
         const rocket::CacheRequest cache{id, details, position, static_cast<bool>(fields.array_read.read(sample))};
         live.request = id;
         association.token = token;
+        if (cache.array_read)
+          association.array_read = position;
         requests.emplace(id, association);
         capture(adapter->bind_request(core, cache));
         return;
@@ -448,6 +489,9 @@ struct RocketNativeDecoder::State {
 
   void release(uint64_t id, bool cancelled) {
     auto &association = request(id);
+    if (association.atomic)
+      throw CheckResult{CheckStatus::Violation, 0,
+                        "Rocket cancelled an AMO after its qualified old/new cache effect"};
     if (association.token) {
       const uint64_t token = *association.token;
       if (!cancelled)
@@ -460,6 +504,46 @@ struct RocketNativeDecoder::State {
       live.request.reset();
     }
     requests.erase(id);
+  }
+
+  void capture_atomic_result(const Sample &sample, uint64_t cycle) {
+    if (!fields.atomic)
+      return;
+    const bool old_valid = fields.atomic->read.valid.read(sample);
+    const bool new_valid = fields.atomic->write.valid.read(sample);
+    if (!old_valid && !new_valid)
+      return;
+    if (old_valid != new_valid)
+      throw CheckResult{CheckStatus::Incomplete, 0, "Rocket atomic sample lacks its paired old/new effect"};
+    const auto access = fields.atomic->read_access.read(sample);
+    const auto id = fields.atomic->read_access.id.read(sample);
+    auto &association = request(id);
+    if (!association.token)
+      throw CheckResult{CheckStatus::Incomplete, 0,
+                        "Rocket untracked bootstrap AMO changes memory outside the independent entry-state"};
+    const auto write = fields.atomic->write.read(sample, source(cycle));
+    if (write.request_id != id || !fields.accepted.valid.read(sample) ||
+        fields.accepted.id.read(sample) != id || !fields.result.valid.read(sample) ||
+        fields.result_access.id.read(sample) != id || !association.result_seen || !association.qualified_store ||
+        !amo_command(access.command) || access.command != association.details.command ||
+        access.size != association.details.size || access.tag != association.details.tag ||
+        (access.address & 0xfff) != (association.details.address & 0xfff) ||
+        access.address != write.physical_address ||
+        (instruction(*association.token).allocation.instruction & 0x7f) != 0x2f || association.atomic)
+      throw std::invalid_argument("Rocket atomic old/new probe disagrees with its successful final cache attempt");
+    if (access.size != 2 && access.size != 3)
+      throw CheckResult{CheckStatus::Unsupported, 0, "Rocket atomic old/new size is outside W/D coverage"};
+    const unsigned count = 1U << access.size;
+    const unsigned lane = access.address & 7;
+    const uint8_t mask = ((1U << count) - 1) << lane;
+    if (!association.array_read || association.array_read->cycle >= cycle)
+      throw CheckResult{CheckStatus::Incomplete, 0, "Rocket atomic old value lacks a prior SRAM read source edge"};
+    if ((access.address & (count - 1)) || lane + count > 8 || write.mask != mask ||
+        fields.accepted.mask.read(sample) != mask || fields.accepted.address.read(sample) != access.address)
+      throw std::invalid_argument("Rocket atomic old/new extent or accepted operand mask disagrees");
+    association.atomic = AtomicObservation{fields.atomic->old_raw_data.read(sample),
+        fields.atomic->old_arch_data.read(sample), write.data, access.address, mask,
+        *association.array_read, write.source, {}};
   }
 
   void cache_results(const Sample &sample, uint64_t cycle) {
@@ -485,6 +569,7 @@ struct RocketNativeDecoder::State {
         requests.erase(id);
       }
     }
+    capture_atomic_result(sample, cycle);
     if (fields.load.valid.read(sample)) {
       const auto id = fields.load_access.id.read(sample);
       auto &association = request(id);
@@ -504,6 +589,21 @@ struct RocketNativeDecoder::State {
     cache_stores(sample, cycle);
   }
 
+  rocket::CacheStoreMember atomic_member(uint64_t id, Request &association, uint64_t cycle) {
+    const auto &evidence = *association.atomic;
+    const auto token = *association.token;
+    const unsigned first_lane = evidence.address & 7;
+    const unsigned byte_count = 1U << association.details.size;
+    rocket::StoreObservation store;
+    store.token = token;
+    store.address = evidence.address;
+    store.source = source(cycle);
+    store.mask.assign(byte_count, 1);
+    for (unsigned byte = 0; byte < byte_count; ++byte)
+      store.bytes.push_back(static_cast<uint8_t>(evidence.final_word >> (8 * (first_lane + byte))));
+    return {id, instruction(token).next_attempt, std::move(store)};
+  }
+
   void accept_store(const Sample &sample, uint64_t cycle) {
     if (!fields.accepted.valid.read(sample))
       return;
@@ -518,6 +618,21 @@ struct RocketNativeDecoder::State {
     }
     if (!association.qualified_store)
       throw std::invalid_argument("Rocket store acceptance lacks a successful cached permission hit");
+    if (amo_command(association.details.command)) {
+      if (!association.atomic)
+        throw CheckResult{CheckStatus::Incomplete, 0,
+                          "Rocket AMO request " + std::to_string(id) +
+                              " lacks paired S1-old/S2-AMOALU evidence"};
+      const auto &evidence = *association.atomic;
+      if (fields.accepted.address.read(sample) != evidence.address ||
+          fields.accepted.mask.read(sample) != evidence.mask)
+        throw std::invalid_argument("Rocket AMO accepted operand differs from its final result extent");
+      // Physical tracking uses the AMOALU result, never storeAccepted.data: the
+      // latter is the input operand and is not the byte value committed by RTL.
+      if (store_groups)
+        require_store_transition(store_groups->accept(atomic_member(id, association, cycle)));
+      return;
+    }
     capture(adapter->accept_store(fields.accepted.read(sample, source(cycle))));
     if (store_groups) {
       rocket::CacheStoreMember member;
@@ -536,10 +651,22 @@ struct RocketNativeDecoder::State {
 
   void publish_singleton(const Sample &sample, uint64_t cycle) {
     const auto id = fields.drain_id.read(sample);
-    const auto &association = request(id);
+    auto &association = request(id);
     if (!association.token || !association.qualified_store)
       throw CheckResult{CheckStatus::Incomplete, 0, "Rocket physical drain has no qualified committed writer"};
     const auto position = publication_position(cycle);
+    if (association.atomic) {
+      if (association.atomic->physical_drain)
+        throw std::invalid_argument("Rocket atomic store physically drained twice");
+      association.atomic->physical_drain = position;
+      // A physical write is evidence, not a proven indivisible global AMO point.
+      // Never route this through ordinary scalar StorePublish.
+      throw CheckResult{CheckStatus::Incomplete, 0,
+                        "Rocket AMO request " + std::to_string(id) + " read cycle " +
+                            std::to_string(association.atomic->array_read.cycle) + " final-data cycle " +
+                            std::to_string(association.atomic->computed.cycle) + " physical-drain cycle " +
+                            std::to_string(position.cycle) + " lacks a certified atomic global-order point"};
+    }
     if (!publications.emplace(id, position).second)
       throw std::invalid_argument("Rocket native store drain was observed twice");
     capture(adapter->publish({{id, fields.drain_address.read(sample), fields.drain_data.read(sample),
@@ -552,15 +679,34 @@ struct RocketNativeDecoder::State {
     rocket::CacheStoreDrain drain{{fields.drain_id.read(sample), fields.drain_address.read(sample),
         fields.drain_data.read(sample), narrow_byte(fields.drain_mask.read(sample)), position},
         narrow_byte(group_fields.physical_mask.read(sample)), static_cast<bool>(group_fields.second_slot.read(sample))};
+    if (!drain.second_slot && amo_command(request(drain.actual.request_id).details.command))
+      throw CheckResult{CheckStatus::Incomplete, 0,
+                        "Rocket first-slot AMO drain needs independently qualified physical SRAM bytes"};
     rocket::StoreGroupObservation group;
     require_store_transition(store_groups->capture_drain(drain, group));
+    std::optional<uint64_t> atomic_id;
     for (const auto &member : group.members) {
-      const auto &association = request(member.request_id);
+      auto &association = request(member.request_id);
       if (!association.token || !association.qualified_store || *association.token != member.store.token ||
           instruction(*association.token).next_attempt != member.attempt)
         throw std::invalid_argument("Rocket merged publication member changed its qualified cache attempt");
-      if (!publications.emplace(member.request_id, position).second)
+      if (association.atomic) {
+        if (association.atomic->physical_drain)
+          throw std::invalid_argument("Rocket atomic group member physically drained twice");
+        association.atomic->physical_drain = position;
+        if (!atomic_id)
+          atomic_id = member.request_id;
+      } else if (!publications.emplace(member.request_id, position).second) {
         throw std::invalid_argument("Rocket merged publication member was physically drained twice");
+      }
+    }
+    if (atomic_id) {
+      const auto &evidence = *request(*atomic_id).atomic;
+      throw CheckResult{CheckStatus::Incomplete, 0,
+                        "Rocket AMO request " + std::to_string(*atomic_id) + " read cycle " +
+                            std::to_string(evidence.array_read.cycle) + " final-data cycle " +
+                            std::to_string(evidence.computed.cycle) + " physical-drain cycle " +
+                            std::to_string(position.cycle) + " lacks indivisible global-order proof"};
     }
     const auto result = adapter->publish_group(group, position.producer_sequence);
     require(result.check);
@@ -641,6 +787,9 @@ struct RocketNativeDecoder::State {
       return;
     const auto found = instructions.find(token);
     if (found != instructions.end()) {
+      if (found->second.request && request(*found->second.request).atomic)
+        throw CheckResult{CheckStatus::Violation, 0,
+                          "Rocket squashed an AMO after a qualified cache data effect"};
       if (found->second.request && publications.count(*found->second.request))
         throw CheckResult{CheckStatus::Violation, 0, "Rocket squashed instruction already changed the cache data array"};
       for (auto pending = requests.begin(); pending != requests.end();) {
@@ -688,6 +837,18 @@ struct RocketNativeDecoder::State {
       throw std::invalid_argument("Rocket native retirement was observed twice");
     if (live.unsupported_memory)
       throw CheckResult{CheckStatus::Unsupported, 0, "Rocket retired an uncached or implicit memory access"};
+    if ((observed.instruction & 0x7f) == 0x2f) {
+      if (!amo_command(observed.memory_command))
+        throw CheckResult{CheckStatus::Unsupported, 0,
+                          "Rocket LR/SC needs its separate reservation and success lifecycle"};
+      if (!live.request || !request(*live.request).atomic)
+        throw CheckResult{CheckStatus::Incomplete, 0,
+                          "Rocket retired AMO lacks its qualified old/new cache attempt"};
+      // Retain this architectural observation until physical publication.
+      // No ordinary scalar retirement may bypass the missing atomic proof.
+      live.retired = true;
+      return;
+    }
     if (fields.floating_point.read(sample) && !fields.floating_write)
       throw CheckResult{CheckStatus::Unsupported, 0, "Rocket FP retirement requires both typed FPU write ports"};
     rocket::NativeRetirement retirement{token, observed.pc, observed.instruction, source(cycle),
