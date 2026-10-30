@@ -33,11 +33,12 @@ class DifftestSRocketObservation(coreType: RocketCoreObservation, cacheType: DCa
   val cacheRequestors = UInt(32.W)
 }
 
-class DifftestSBoomObservation(coreWidth: Int, robEntries: Int, lsuWidth: Int) extends Bundle {
+class DifftestSBoomObservation(coreWidth: Int, robEntries: Int, lsuWidth: Int,
+                                cacheType: boom.v4.difftest.DifftestCacheObservation) extends Bundle {
   val source = new DifftestSSource
   val core = new boom.v4.difftest.DifftestCoreObservation(coreWidth, robEntries)
   val lsu = new boom.v4.difftest.DifftestLsuObservation(lsuWidth, coreWidth)
-  val cache = new boom.v4.difftest.DifftestCacheObservation(lsuWidth)
+  val cache = cacheType.cloneType
 }
 
 case class DifftestSRocketPort(getIO: () => DifftestSRocketObservation, tileId: Int)
@@ -114,12 +115,17 @@ trait CanHaveDifftestSObservations { this: ChipyardSystem =>
           val core = boomTile.boomParams.core
           require(core.enableDifftest, "Difftest-S BOOM observations are not enabled")
           require(!core.clockGate, "Difftest-S BOOM observation export requires an ungated core clock")
-          val port = IO(Output(new DifftestSBoomObservation(core.decodeWidth, core.numRobEntries, core.lsuWidth)))
+          // Clone the actual BOOM cache probe; its TL beat width and MMIO
+          // source count come from the selected tile, not a parallel guess.
+          val cache = boomTile.module.difftest_cache.getOrElse(
+            throw new IllegalArgumentException("Difftest-S BOOM cache observations are not enabled"))
+          val port = IO(Output(new DifftestSBoomObservation(core.decodeWidth, core.numRobEntries,
+            core.lsuWidth, cache)))
             .suggestName(s"difftest_s_boom_$tileId")
           source(port.source, boomTile.module.clock, boomTile.module.reset)
           port.core := BoringUtils.bore(boomTile.module.difftest_core.get)
           port.lsu := BoringUtils.bore(boomTile.module.difftest_lsu.get)
-          port.cache := BoringUtils.bore(boomTile.module.difftest_cache.get)
+          port.cache := BoringUtils.bore(cache)
           val control = boomControls(tileId).getWrappedValue
           BoringUtils.bore(port.source.epoch, Seq(control.epoch))
           BoringUtils.bore(port.source.cycle, Seq(control.cycle))
