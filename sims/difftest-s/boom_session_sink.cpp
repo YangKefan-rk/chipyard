@@ -142,10 +142,11 @@ public:
         value |= uint64_t(store.bytes[index]) << (index * 8);
       if (value != tohost_success_value_)
         return CheckResult{CheckStatus::Violation, 0, "HartBreaker audited REF tohost store has an incorrect exit value"};
-      if (tohost_store_ && tohost_store_->hart != store.id.hart)
-        return CheckResult{CheckStatus::Violation, 0, "HartBreaker has multiple winning tohost harts"};
-      if (!tohost_store_)
-        tohost_store_ = store.id;
+      // Each hart has a termination loop. Audit every success store; the
+      // first observed owner is only a terminal-progress hint, not a unique
+      // winner or a substitute for physical drain.
+      if (!first_tohost_store_)
+        first_tohost_store_ = store.id;
       return result;
     };
     session_ = std::make_unique<rvwmo::HostSession>(memory_, std::move(config));
@@ -250,10 +251,10 @@ public:
       const auto parked = std::count_if(parked_harts_.begin(), parked_harts_.end(),
           [](const auto &marker) { return marker.has_value(); });
       session_->report_source_failure({CheckStatus::Incomplete, 0,
-          !tohost_store_ ? "HartBreaker has no audited retiring tohost success store" :
-          parked != parked_harts_.size() - 1 || parked_harts_[tohost_store_->hart]
-            ? "HartBreaker winner and three WFI parking boundaries are unproven"
-            : "HartBreaker winner stop and four-hart physical drain are unproven"});
+          !first_tohost_store_ ? "HartBreaker has no audited retiring tohost success store" :
+          parked != parked_harts_.size() - 1 || parked_harts_[first_tohost_store_->hart]
+            ? "HartBreaker first success and other WFI parking boundaries are unproven"
+            : "HartBreaker first success stop and four-hart physical drain are unproven"});
     }
     auto result = session_->finalize(cycle_);
     std::fprintf(stderr, "DIFFTEST_S_FINAL %s\n", session_->final_report().c_str());
@@ -269,7 +270,7 @@ private:
   uint64_t terminal_pc_ = 0;
   uint64_t success_address_ = 0, success_value_ = 0;
   uint64_t tohost_address_ = 0, tohost_success_value_ = 0, parked_wfi_pc_ = 0;
-  std::optional<rvwmo::OperationId> tohost_store_;
+  std::optional<rvwmo::OperationId> first_tohost_store_;
   bool completed_ = false;
   struct SubmittedTerminalMarker { rvwmo::OperationId id; uint64_t source_cycle; };
   std::vector<std::optional<SubmittedTerminalMarker>> submitted_markers_;
