@@ -10,6 +10,8 @@ int main(int argc, char **argv) {
   auto model = std::make_unique<VTestDriver>(context.get(), "");
   while (!context->gotFinish()) {
     model->eval();
+    if (difftest_s::native::native_terminal_drain_complete())
+      break;
     if (!model->eventsPending())
       break;
     context->time(model->nextTimeSlot());

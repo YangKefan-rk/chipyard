@@ -64,18 +64,24 @@ private class DifftestSNativeProbe(kind: Int, hart: Int, rosterSize: Int, width:
     val epoch = Input(UInt(64.W))
     val cycle = Input(UInt(64.W))
     val payload = Input(UInt(width.W))
+    val stop = Output(Bool())
   })
   setInline("DifftestSNativeProbe.sv", """
     |module DifftestSNativeProbe #(
     |  parameter int KIND = 0, HART = 0, HARTS = 0, PAYLOAD_BITS = 1
     |)(input clock, input reset, input [63:0] epoch, input [63:0] cycle,
-    |  input [PAYLOAD_BITS-1:0] payload);
+    |  input [PAYLOAD_BITS-1:0] payload, output bit stop);
     |  import "DPI-C" function void difftest_s_native_sample(
     |    input int abi_version, input int kind, input int hart, input int harts,
     |    input longint unsigned transport_tick, input bit reset,
     |    input longint unsigned epoch, input longint unsigned source_cycle,
     |    input int payload_bits, input bit [PAYLOAD_BITS-1:0] words);
     |  import "DPI-C" function void difftest_s_native_finish();
+    |  import "DPI-C" function bit difftest_s_native_stop_requested(input int kind, input int hart);
+    |  initial stop = 0;
+    |  always @(negedge clock) begin
+    |    stop <= reset ? 0 : difftest_s_native_stop_requested(KIND, HART);
+    |  end
     |  longint unsigned transport_tick = 0;
     |  always @(posedge clock) begin
     |    difftest_s_native_sample(1, KIND, HART, HARTS, transport_tick,
@@ -115,4 +121,5 @@ class WithDifftestSNativeSimulation extends HarnessBinder({
     probe.io.epoch := observation.source.epoch
     probe.io.cycle := observation.source.cycle
     probe.io.payload := payload
+    observation.stop := probe.io.stop
 })

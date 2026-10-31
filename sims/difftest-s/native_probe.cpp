@@ -1,5 +1,6 @@
 #include "native_probe.h"
 #include <svdpi.h>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -15,6 +16,16 @@ namespace {
 constexpr size_t max_pending_frames = 64;
 constexpr uint32_t max_harts = 256;
 constexpr uint32_t max_payload_bits = 1 << 20;
+
+struct TerminalDrainControl {
+  std::atomic<uint32_t> harts{0};
+  std::atomic<uint64_t> requested{0};
+  std::atomic<bool> complete{false};
+};
+TerminalDrainControl &terminal_control() {
+  static TerminalDrainControl control;
+  return control;
+}
 
 std::string json_string(const std::string &value) {
   constexpr char hex[] = "0123456789abcdef";
@@ -248,6 +259,33 @@ bool register_native_consumer(NativeFrameConsumer consume, NativeFinalizer finis
 int native_exit_status() {
   return ingress().exit_status();
 }
+
+bool enable_native_terminal_drain(uint32_t harts) {
+  if (!harts || harts > 64)
+    return false;
+  uint32_t expected = 0;
+  return terminal_control().harts.compare_exchange_strong(expected, harts);
+}
+
+void request_native_fetch_stop(uint32_t hart) {
+  auto &control = terminal_control();
+  if (hart >= control.harts.load())
+    throw std::invalid_argument("terminal fetch stop names an unregistered hart");
+  control.requested.fetch_or(uint64_t{1} << hart);
+}
+
+void complete_native_terminal_drain() {
+  auto &control = terminal_control();
+  const auto harts = control.harts.load();
+  const auto expected = harts == 64 ? UINT64_MAX : (uint64_t{1} << harts) - 1;
+  if (!harts || control.requested.load() != expected)
+    throw std::logic_error("terminal drain cannot complete before every hart has a stop request");
+  control.complete.store(true);
+}
+
+bool native_terminal_drain_complete() {
+  return terminal_control().harts.load() && terminal_control().complete.load();
+}
 } // namespace difftest_s::native
 
 extern "C" void difftest_s_native_sample(int abi, int kind, int hart, int harts, uint64_t tick,
@@ -271,4 +309,16 @@ extern "C" void difftest_s_native_finish() {
     std::fprintf(stderr, "DIFFTEST-S native finalization exception: unknown exception\n");
     std::abort();
   }
+}
+
+extern "C" svBit difftest_s_native_stop_requested(int kind, int hart) {
+  const auto &control = difftest_s::native::terminal_control();
+  return kind == 1 && hart >= 0 && static_cast<uint32_t>(hart) < control.harts.load() &&
+      ((control.requested.load() >> hart) & 1);
+}
+
+extern "C" svBit difftest_s_native_defer_finish() {
+  // HB success is released only after a complete eval/frame in the C++ main.
+  // Calling $finish from one posedge block could strand the other hart samples.
+  return difftest_s::native::terminal_control().harts.load() != 0;
 }

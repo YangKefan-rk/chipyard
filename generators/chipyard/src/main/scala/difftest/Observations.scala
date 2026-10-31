@@ -25,12 +25,13 @@ class DifftestSRocketTerminal extends Bundle {
 }
 
 class DifftestSRocketObservation(coreType: RocketCoreObservation, cacheType: DCacheObservation) extends Bundle {
-  val source = new DifftestSSource
-  val core = coreType.cloneType
-  val cache = cacheType.cloneType
-  val terminal = new DifftestSRocketTerminal
-  val coreRequestor = UInt(32.W)
-  val cacheRequestors = UInt(32.W)
+  val source = Output(new DifftestSSource)
+  val core = Output(coreType.cloneType)
+  val cache = Output(cacheType.cloneType)
+  val terminal = Output(new DifftestSRocketTerminal)
+  val coreRequestor = Output(UInt(32.W))
+  val cacheRequestors = Output(UInt(32.W))
+  val stop = Input(Bool())
 }
 
 class DifftestSBoomObservation(coreWidth: Int, robEntries: Int, lsuWidth: Int) extends Bundle {
@@ -56,6 +57,18 @@ trait CanHaveDifftestSObservations { this: ChipyardSystem =>
     require(tileAttachParams.nonEmpty, "Difftest-S observations require at least one tile")
     require(tileCrossingTypes.forall(_.isInstanceOf[SynchronousCrossing]),
       "Difftest-S observation export requires synchronous tile crossings")
+
+    val rocketControls = tile_prci_domains.toSeq.flatMap { case (tileId, domain) => domain.element match {
+      case rocket: RocketTile =>
+        Some(tileId -> domain.element_reset_domain {
+          InModuleBody {
+            val stop = Wire(Bool()).suggestName(s"difftest_s_stop_$tileId")
+            rocket.module.difftestStop.get := stop
+            stop
+          }
+        })
+      case _ => None
+    }}.toMap
 
     val boomControls = tile_prci_domains.toSeq.flatMap { case (tileId, domain) => domain.element match {
       case boomTile: boom.v4.common.BoomTile =>
@@ -100,7 +113,7 @@ trait CanHaveDifftestSObservations { this: ChipyardSystem =>
             throw new IllegalArgumentException("Difftest-S Rocket core observations are not enabled"))
           val cache = rocket.dcache.module.io.difftest.getOrElse(
             throw new IllegalArgumentException("Difftest-S Rocket cache observations are not enabled"))
-          val port = IO(Output(new DifftestSRocketObservation(core, cache)))
+          val port = IO(new DifftestSRocketObservation(core, cache))
             .suggestName(s"difftest_s_rocket_$tileId")
           source(port.source, rocket.module.clock, rocket.module.reset)
           port.core := BoringUtils.bore(core)
@@ -108,6 +121,7 @@ trait CanHaveDifftestSObservations { this: ChipyardSystem =>
           port.terminal.wfi := BoringUtils.bore(rocket.module.core.io.wfi)
           port.coreRequestor := BoringUtils.bore(rocket.module.difftestCoreRequestor.get)
           port.cacheRequestors := BoringUtils.bore(rocket.module.difftestCacheRequestors.get)
+          BoringUtils.bore(port.stop, Seq(rocketControls(tileId).getWrappedValue))
           DifftestSRocketPort(() => port, tileId)
 
         case boomTile: boom.v4.common.BoomTile =>
@@ -137,9 +151,9 @@ class WithDifftestSObservationPunchthrough extends OverrideLazyIOBinder({
   (system: CanHaveDifftestSObservations) => InModuleBody {
     val ports = system.difftestSPorts.toSeq.flatMap(_.getWrappedValue).map {
       case rocket: DifftestSRocketPort =>
-        val port = IO(Output(chiselTypeOf(rocket.getIO())))
+        val port = IO(chiselTypeOf(rocket.getIO()))
           .suggestName(s"difftest_s_rocket_${rocket.tileId}")
-        port := rocket.getIO()
+        port <> rocket.getIO()
         DifftestSRocketPort(() => port, rocket.tileId)
       case boom: DifftestSBoomPort =>
         val port = IO(Output(chiselTypeOf(boom.getIO())))
