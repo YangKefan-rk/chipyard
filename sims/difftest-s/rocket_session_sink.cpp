@@ -153,8 +153,10 @@ public:
       const auto fabric = rvwmo::memory_fabric_producer_id(hart);
       config.stream.required_producers.push_back({producer, hart_kinds});
       config.producers.push_back({producer, true, true, true, hart_kinds});
-      config.stream.required_producers.push_back({fabric, {rvwmo::RuntimeEventKind::StorePublish}});
-      config.producers.push_back({fabric, true, true, true, {rvwmo::RuntimeEventKind::StorePublish}});
+      const std::vector<rvwmo::RuntimeEventKind> fabric_kinds = {
+        rvwmo::RuntimeEventKind::StorePublish, rvwmo::RuntimeEventKind::AtomicCommitCandidate};
+      config.stream.required_producers.push_back({fabric, fabric_kinds});
+      config.producers.push_back({fabric, true, true, true, fabric_kinds});
       RocketDecoderConfiguration source_config;
       source_config.publication_producer = fabric;
       source_config.entry_pc = scoped ? initial.pc : 0;

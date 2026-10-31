@@ -361,6 +361,12 @@ struct RocketNativeDecoder::State {
             requests.erase(*live.request);
             live.request.reset();
           }
+        } else if (event.kind == rvwmo::RuntimeEventKind::AtomicCommitCandidate) {
+          const auto &candidate = std::get<rvwmo::AtomicCommitCandidateEvent>(event.payload);
+          auto &live = instruction(uid_tokens.at(candidate.id.uid));
+          if (live.id != candidate.id || !live.request || *live.request != candidate.request_id ||
+              !publications.erase(candidate.request_id))
+            throw std::invalid_argument("Rocket AMO candidate has no unique retained physical drain");
         } else if (event.kind == rvwmo::RuntimeEventKind::StorePublish) {
           const auto &published = std::get<rvwmo::StorePublishEvent>(event.payload);
           if (published.members.empty())
@@ -649,6 +655,35 @@ struct RocketNativeDecoder::State {
     return position;
   }
 
+  void publish_atomic(uint64_t id, uint64_t actual_word, uint8_t actual_mask, SourcePosition position) {
+    auto &association = request(id);
+    if (!association.atomic || !association.token)
+      throw std::invalid_argument("Rocket atomic drain has no qualified old/new request");
+    auto &evidence = *association.atomic;
+    if (evidence.physical_drain || evidence.mask != actual_mask)
+      throw std::invalid_argument("Rocket atomic drain changed its mask or was observed twice");
+    evidence.physical_drain = position;
+    const uint64_t token = *association.token;
+    const auto &live = instruction(token);
+    rvwmo::AtomicCommitCandidateEvent candidate;
+    candidate.id = live.id;
+    candidate.attempt = live.next_attempt;
+    candidate.request_id = id;
+    candidate.address = evidence.address & ~uint64_t{7};
+    candidate.byte_mask = evidence.mask;
+    // The architectural return is sign-extended and lane-shifted by LoadGen.
+    // Byte witnesses use the original aligned SRAM word, including AMO.W +4.
+    candidate.observed_old = evidence.old_raw;
+    candidate.computed_new = evidence.final_word;
+    candidate.drained_new = actual_word;
+    candidate.sampled_read = evidence.array_read;
+    candidate.computed_write = evidence.computed;
+    candidate.physical_drain = position;
+    if (!publications.emplace(id, position).second)
+      throw std::invalid_argument("Rocket atomic publication identity was reused");
+    capture(adapter->atomic_candidate(token, candidate, position));
+  }
+
   void publish_singleton(const Sample &sample, uint64_t cycle) {
     const auto id = fields.drain_id.read(sample);
     auto &association = request(id);
@@ -656,16 +691,8 @@ struct RocketNativeDecoder::State {
       throw CheckResult{CheckStatus::Incomplete, 0, "Rocket physical drain has no qualified committed writer"};
     const auto position = publication_position(cycle);
     if (association.atomic) {
-      if (association.atomic->physical_drain)
-        throw std::invalid_argument("Rocket atomic store physically drained twice");
-      association.atomic->physical_drain = position;
-      // A physical write is evidence, not a proven indivisible global AMO point.
-      // Never route this through ordinary scalar StorePublish.
-      throw CheckResult{CheckStatus::Incomplete, 0,
-                        "Rocket AMO request " + std::to_string(id) + " read cycle " +
-                            std::to_string(association.atomic->array_read.cycle) + " final-data cycle " +
-                            std::to_string(association.atomic->computed.cycle) + " physical-drain cycle " +
-                            std::to_string(position.cycle) + " lacks a certified atomic global-order point"};
+      publish_atomic(id, fields.drain_data.read(sample), narrow_byte(fields.drain_mask.read(sample)), position);
+      return;
     }
     if (!publications.emplace(id, position).second)
       throw std::invalid_argument("Rocket native store drain was observed twice");
@@ -691,22 +718,20 @@ struct RocketNativeDecoder::State {
           instruction(*association.token).next_attempt != member.attempt)
         throw std::invalid_argument("Rocket merged publication member changed its qualified cache attempt");
       if (association.atomic) {
-        if (association.atomic->physical_drain)
-          throw std::invalid_argument("Rocket atomic group member physically drained twice");
-        association.atomic->physical_drain = position;
-        if (!atomic_id)
-          atomic_id = member.request_id;
+        if (atomic_id)
+          throw CheckResult{CheckStatus::Unsupported, 0, "Rocket one physical group contains multiple AMOs"};
+        atomic_id = member.request_id;
       } else if (!publications.emplace(member.request_id, position).second) {
         throw std::invalid_argument("Rocket merged publication member was physically drained twice");
       }
     }
     if (atomic_id) {
-      const auto &evidence = *request(*atomic_id).atomic;
-      throw CheckResult{CheckStatus::Incomplete, 0,
-                        "Rocket AMO request " + std::to_string(*atomic_id) + " read cycle " +
-                            std::to_string(evidence.array_read.cycle) + " final-data cycle " +
-                            std::to_string(evidence.computed.cycle) + " physical-drain cycle " +
-                            std::to_string(position.cycle) + " lacks indivisible global-order proof"};
+      if (group.members.size() != 1)
+        throw CheckResult{CheckStatus::Unsupported, 0, "Rocket coalesced AMO and ordinary stores need a joint witness"};
+      publish_atomic(*atomic_id, drain.actual.data, drain.actual.mask, position);
+      require_store_transition(store_groups->acknowledge_drain(group.anchor_request_id));
+      collect_output();
+      return;
     }
     const auto result = adapter->publish_group(group, position.producer_sequence);
     require(result.check);
@@ -844,10 +869,8 @@ struct RocketNativeDecoder::State {
       if (!live.request || !request(*live.request).atomic)
         throw CheckResult{CheckStatus::Incomplete, 0,
                           "Rocket retired AMO lacks its qualified old/new cache attempt"};
-      // Retain this architectural observation until physical publication.
-      // No ordinary scalar retirement may bypass the missing atomic proof.
-      live.retired = true;
-      return;
+      // The private adapter retains this original ROB retirement timestamp
+      // while waiting for its matching physical atomic drain and final writeback.
     }
     if (fields.floating_point.read(sample) && !fields.floating_write)
       throw CheckResult{CheckStatus::Unsupported, 0, "Rocket FP retirement requires both typed FPU write ports"};
