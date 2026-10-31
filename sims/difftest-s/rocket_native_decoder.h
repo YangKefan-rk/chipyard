@@ -14,6 +14,7 @@ struct RocketDecoderConfiguration {
   // Zero checks the whole source. A nonzero entry explicitly excludes bootstrap.
   uint64_t entry_pc = 0;
   bool require_terminal_observations = false;
+  bool require_fetch_stop = false;
 };
 
 struct RocketTerminalFacts {
@@ -22,6 +23,12 @@ struct RocketTerminalFacts {
   bool pending_integer_writeback = false;
   bool wfi_wake_pending = false;
   bool pending_floating_writeback = false;
+};
+
+struct RocketFetchStopFacts {
+  bool requested = false;
+  bool accepted = false;
+  uint64_t last_allocation_token = 0;
 };
 
 struct RocketBootstrapCounts {
@@ -41,6 +48,7 @@ struct RocketDecodedFrame {
   bool tracked_work_drained = false;
   std::optional<bool> physically_idle;
   std::optional<RocketTerminalFacts> terminal;
+  std::optional<RocketFetchStopFacts> fetch_stop;
 };
 
 // Allocates a unique fabric source identity at the observed drain edge. The

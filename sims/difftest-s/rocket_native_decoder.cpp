@@ -146,6 +146,7 @@ struct Fields {
   NativeField retire_memory, retire_command, late_token, late_known, late_destination, late_data;
   NativeField execute_killed, execute_token, memory_killed, memory_token, wb_rejected, wb_token;
   std::optional<NativeField> terminal_wfi, pipeline_empty, pending_integer_writeback, wfi_wake_pending;
+  std::optional<NativeField> stop_requested, stop_accepted, last_allocation_token;
   std::optional<NativeField> floating_write, pending_floating_writeback, fcsr;
   std::vector<FpWriteFields> floating_writes;
 
@@ -234,6 +235,17 @@ struct Fields {
     } else if (pending_floating_writeback || !metadata.records("core.floatingPointWrites").empty()) {
       throw std::invalid_argument("Rocket FP layout contains only a partial observation set");
     }
+    stop_requested = optional_flag("core.stopRequested");
+    stop_accepted = optional_flag("core.stopAccepted");
+    for (size_t index = 0; index < layout.field_count; ++index)
+      if (std::string_view(layout.fields[index].path) == "core.lastAllocationToken") {
+        last_allocation_token = metadata.field("core.lastAllocationToken");
+        if (last_allocation_token->width != 64)
+          throw std::invalid_argument("Rocket stop allocation token must have 64 bits");
+      }
+    const bool any_stop = stop_requested || stop_accepted || last_allocation_token;
+    if (any_stop && (!stop_requested || !stop_accepted || !last_allocation_token))
+      throw std::invalid_argument("Rocket native layout has partial fetch-stop observations");
     terminal_wfi = optional_flag("terminal.wfi");
     pipeline_empty = optional_flag("core.pipelineEmpty");
     pending_integer_writeback = optional_flag("core.pendingIntegerWriteback");
@@ -302,6 +314,10 @@ struct RocketNativeDecoder::State {
     if (config.require_terminal_observations && (!fields.terminal_wfi || !fields.cache_idle))
       failure = {CheckStatus::Unsupported, 0,
                  "Rocket WFI terminal checking requires WFI, pipeline, writeback, wake, and cache-idle observations"};
+    if (config.require_fetch_stop && (!fields.stop_requested || !fields.stop_accepted ||
+        !fields.last_allocation_token || !fields.pipeline_empty || !fields.cache_idle))
+      failure = {CheckStatus::Unsupported, 0,
+                 "Rocket terminal drain requires native fetch-stop, pipeline and cache observations"};
   }
 
   SourcePosition source(uint64_t cycle) {
@@ -309,6 +325,10 @@ struct RocketNativeDecoder::State {
       throw std::invalid_argument("Rocket native source sequence exhausted");
     return {cycle, 0, next_sequence++, false};
   }
+
+  std::optional<uint64_t> stopped_cycle;
+  std::optional<uint64_t> stopped_token;
+  uint64_t last_allocated_token = 0;
 
   CheckResult remember(CheckResult result) {
     if (!result && result.status != CheckStatus::Pending)
@@ -436,6 +456,11 @@ struct RocketNativeDecoder::State {
     if (!fields.allocate.valid.read(sample))
       return;
     auto allocation = fields.allocation.read(sample, source(cycle));
+    if (stopped_cycle)
+      throw std::invalid_argument("Rocket accepted a new instruction after fetch-stop acknowledgement");
+    if (allocation.token <= last_allocated_token)
+      throw std::invalid_argument("Rocket native allocation token is not globally increasing");
+    last_allocated_token = allocation.token;
     if (!entry_token && configuration.entry_pc == allocation.pc)
       entry_token = allocation.token;
     if (!in_scope(allocation.token))
@@ -925,6 +950,27 @@ struct RocketNativeDecoder::State {
                                    (!configuration.entry_pc || entry_token.has_value());
   }
 
+  void observe_fetch_stop(const Sample &sample, uint64_t cycle) {
+    if (!fields.stop_requested)
+      return;
+    const bool requested = fields.stop_requested->read(sample);
+    const bool accepted = fields.stop_accepted->read(sample);
+    const auto token = fields.last_allocation_token->read(sample);
+    if (accepted && !requested)
+      throw std::invalid_argument("Rocket fetch-stop acknowledgement lacks its request");
+    if (stopped_cycle) {
+      if (!accepted || !requested || token != *stopped_token)
+        throw std::invalid_argument("Rocket fetch-stop acknowledgement or token changed before reset");
+      return;
+    }
+    if (!accepted)
+      return;
+    if (token != last_allocated_token)
+      throw std::invalid_argument("Rocket fetch-stop token differs from the last accepted instruction");
+    stopped_cycle = cycle;
+    stopped_token = token;
+  }
+
   CheckResult decode(const NativeFrame &frame, RocketDecodedFrame &converted) {
     if (!failure)
       return failure;
@@ -977,6 +1023,7 @@ struct RocketNativeDecoder::State {
           throw CheckResult{CheckStatus::Unsupported, 0, "Rocket trap or interrupt requires the shared architectural trap protocol"};
         ++bootstrap.traps;
       }
+      observe_fetch_stop(sample, frame.source_cycle);
       allocate(sample, frame.source_cycle);
       bind(sample, frame.source_cycle);
       cache_results(sample, frame.source_cycle);
@@ -1010,6 +1057,11 @@ struct RocketNativeDecoder::State {
             static_cast<bool>(fields.wfi_wake_pending->read(sample)),
             fields.pending_floating_writeback && fields.pending_floating_writeback->read(sample)};
       }
+      if (fields.stop_requested)
+        staged.fetch_stop = RocketFetchStopFacts{
+            static_cast<bool>(fields.stop_requested->read(sample)),
+            static_cast<bool>(fields.stop_accepted->read(sample)),
+            fields.last_allocation_token->read(sample)};
       output = nullptr;
       converted = std::move(staged);
       return {};
