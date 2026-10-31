@@ -33,6 +33,7 @@ void select_entry_scope(boom::NativeFrame &frame, uint64_t entry_uid) {
   exclude_bootstrap(frame.retired_loads, entry_uid, identity);
   exclude_bootstrap(frame.store_releases, entry_uid, identity);
   exclude_bootstrap(frame.squashes, entry_uid, identity);
+  exclude_bootstrap(frame.atomic_applied, entry_uid, identity);
   const auto probe_identity = [](const auto &record) { return record.probe.identity; };
   exclude_bootstrap(frame.completions, entry_uid, probe_identity);
   exclude_bootstrap(frame.publications, entry_uid, probe_identity);
@@ -263,15 +264,18 @@ CheckResult BoomNativeSource::take_ready(boom::CollectedObservations &output) {
     if (event.source.cycle > through)
       continue;
     auto converted = event;
-    if (event.kind == rvwmo::RuntimeEventKind::StorePublish) {
+    const bool atomic_effect = event.kind == rvwmo::RuntimeEventKind::AtomicLifecycle &&
+        std::get<rvwmo::AtomicLifecycleEvent>(event.payload).phase == rvwmo::AtomicObservationPhase::RmwEffect;
+    if (event.kind == rvwmo::RuntimeEventKind::StorePublish || atomic_effect) {
       if (next_fabric_sequence == UINT64_MAX)
         return remember_failure(invalid("BOOM public fabric source sequence exhausted"));
-      // One channel per native L1 preserves its single write port. Cross-L1
-      // simultaneous writes remain on distinct unqualified producers. Delivery
-      // numbering within each channel never creates a cross-L1 GMO phase.
+      // Renumber all physical L1 effects together after delayed frames have
+      // joined the closed prefix. Their captured sequence may include effects
+      // outside the checked scope, while one producer must never reuse a rank.
       converted.source.producer_sequence = ++next_fabric_sequence;
-      for (auto &member : std::get<rvwmo::StorePublishEvent>(converted.payload).members)
-        member.publish_position = converted.source;
+      if (event.kind == rvwmo::RuntimeEventKind::StorePublish)
+        for (auto &member : std::get<rvwmo::StorePublishEvent>(converted.payload).members)
+          member.publish_position = converted.source;
     }
     if (event.kind == rvwmo::RuntimeEventKind::InstructionRetire) {
       const auto &instruction = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction;

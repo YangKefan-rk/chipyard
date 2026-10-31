@@ -130,16 +130,41 @@ struct LoadFields : RecordFields {
 };
 
 struct StoreFields : RecordFields {
-  NativeField index, address, word, size, mask, atomic;
+  NativeField index, address, word, size, mask, atomic, command;
   StoreFields(const NativeFields &fields, const std::string &path)
       : RecordFields(fields, path), index(fields.field(path + ".bits.queue_index")),
         address(fields.field(path + ".bits.address")), word(fields.field(path + ".bits.word")),
         size(fields.field(path + ".bits.mem_size")), mask(fields.field(path + ".bits.byte_mask")),
-        atomic(fields.field(path + ".bits.atomic")) {}
+        atomic(fields.field(path + ".bits.atomic")), command(fields.field(path + ".bits.command")) {}
   boom::ProbeStore read(const Sample &sample) const {
     return {identity.read(sample), static_cast<uint32_t>(index.read(sample)), address.read(sample), word.read(sample),
             static_cast<uint8_t>(size.read(sample)), static_cast<uint8_t>(mask.read(sample)),
-            static_cast<bool>(atomic.read(sample))};
+            static_cast<bool>(atomic.read(sample)), static_cast<uint8_t>(command.read(sample))};
+  }
+};
+
+struct AtomicAppliedFields : RecordFields {
+  NativeField address, old_word, new_word, byte_mask, queue_index, mem_size, command, exclusive_valid;
+  AtomicAppliedFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), address(fields.field(path + ".bits.address")),
+        old_word(fields.field(path + ".bits.old_word")), new_word(fields.field(path + ".bits.new_word")),
+        byte_mask(fields.field(path + ".bits.byte_mask")),
+        queue_index(fields.field(path + ".bits.queue_index")),
+        mem_size(fields.field(path + ".bits.mem_size")), command(fields.field(path + ".bits.command")),
+        exclusive_valid(fields.field(path + ".bits.exclusive_valid")) {}
+  boom::NativeAtomicApplied read(const Sample &sample) const {
+    boom::NativeAtomicApplied effect;
+    effect.identity = identity.read(sample);
+    effect.source_cycle = cycle.read(sample);
+    effect.address = address.read(sample);
+    effect.old_word = old_word.read(sample);
+    effect.new_word = new_word.read(sample);
+    effect.byte_mask = static_cast<uint8_t>(byte_mask.read(sample));
+    effect.queue_index = static_cast<uint32_t>(queue_index.read(sample));
+    effect.mem_size = static_cast<uint8_t>(mem_size.read(sample));
+    effect.command = static_cast<uint8_t>(command.read(sample));
+    effect.exclusive_valid = exclusive_valid.read(sample);
+    return effect;
   }
 };
 
@@ -273,6 +298,7 @@ struct BoomNativeDecoder::Fields {
   std::vector<NativeField> retire_data;
   AttemptFields release;
   StoreFields publication;
+  std::optional<AtomicAppliedFields> atomic_applied;
   NativeField terminal_armed, terminal_pc, terminal_reached, terminal_stopped, terminal_empty;
   NativeField terminal_writeback, terminal_interrupt, terminal_cycle, marker_cycle, marker_pc, marker_instruction;
   IdentityFields marker_identity;
@@ -307,6 +333,8 @@ struct BoomNativeDecoder::Fields {
         marker_pc(metadata.field("core.terminal.marker.pc")),
         marker_instruction(metadata.field("core.terminal.marker.instruction")),
         marker_identity(metadata, "core.terminal.marker.identity") {
+    if (metadata.has_field("cache.atomic_applied.valid"))
+      atomic_applied.emplace(metadata, "cache.atomic_applied");
     if (metadata.has_field("core.wfi_park.valid"))
       wfi.emplace(metadata, "core.wfi_park");
     if (metadata.has_field("core.csr_post.valid"))
@@ -383,19 +411,43 @@ struct BoomNativeDecoder::Fields {
       release.require_current(sample, frame.cycle);
       frame.store_releases.push_back(release.read(sample));
     }
-    if (publication.valid.read(sample)) {
+    const bool accepted_atomic = atomic_applied && atomic_applied->valid.read(sample);
+    const bool accepted_write = publication.valid.read(sample);
+    if (accepted_atomic && !accepted_write)
+      throw std::invalid_argument("BOOM AMO effect has no matching exclusive data-array write");
+    if (accepted_write) {
       publication.require_current(sample, frame.cycle);
-      // Each observed scalar data-array write carries one native STQ writer,
-      // including per-request MSHR replay. This is not an ACK or a slot release.
+      const auto physical = publication.read(sample);
+      // Both records arise from the same exclusive dataWriteArb.fire. Never
+      // count an AMO again as an ordinary StorePublish.
+      if (accepted_atomic) {
+        atomic_applied->require_current(sample, frame.cycle);
+        auto rmw = atomic_applied->read(sample);
+        const auto &lhs = rmw.identity;
+        const auto &rhs = physical.identity;
+        if (!physical.atomic || lhs.epoch != rhs.epoch || lhs.uid != rhs.uid ||
+            lhs.rob_generation != rhs.rob_generation ||
+            lhs.memory_generation != rhs.memory_generation || lhs.attempt != rhs.attempt ||
+            rmw.address != physical.address || rmw.new_word != physical.word ||
+            rmw.byte_mask != physical.byte_mask || rmw.queue_index != physical.queue_index ||
+            rmw.mem_size != physical.log2_size || rmw.command != physical.command)
+          throw std::invalid_argument("BOOM AMO effect disagrees with its physical cache write");
+      }
       auto source = publication_source(frame.cycle);
       if (source.position.cycle != frame.cycle)
         throw std::invalid_argument("BOOM fabric source allocator changed the hardware publication cycle");
-      // dataWriteArb.fire writes the exclusive data array at this active edge.
-      // Different L1s share phase 1, so this does not order their writes.
       source.position.qualified_phase = 1;
-      source.position.order_qualified = true;
-      frame.publications.push_back({publication.read(sample), source,
-          source.position.producer_sequence, boom::StorePublicationEvidence::ExclusiveCacheDataWrite, true});
+      if (accepted_atomic) {
+        auto rmw = atomic_applied->read(sample);
+        source.position.order_qualified = rmw.exclusive_valid;
+        rmw.source = source;
+        frame.atomic_applied.push_back(std::move(rmw));
+      } else {
+        // An unpaired atomic store remains unsupported in the private adapter.
+        source.position.order_qualified = true;
+        frame.publications.push_back({physical, source, source.position.producer_sequence,
+            boom::StorePublicationEvidence::ExclusiveCacheDataWrite, true});
+      }
     }
     frame.trap = trap.valid.read(sample);
     if (frame.trap)

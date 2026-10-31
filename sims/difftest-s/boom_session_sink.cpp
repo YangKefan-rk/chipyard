@@ -110,7 +110,8 @@ public:
     const std::vector<rvwmo::RuntimeEventKind> hart_kinds = {
       rvwmo::RuntimeEventKind::InstructionAllocate, rvwmo::RuntimeEventKind::InstructionRetire,
       rvwmo::RuntimeEventKind::InstructionCancelAttempt, rvwmo::RuntimeEventKind::InstructionSquash,
-      rvwmo::RuntimeEventKind::LocalStore, rvwmo::RuntimeEventKind::LoadSample};
+      rvwmo::RuntimeEventKind::LocalStore, rvwmo::RuntimeEventKind::LoadSample,
+      rvwmo::RuntimeEventKind::AtomicLifecycle};
     for (uint32_t hart = 0; hart < layout->harts; ++hart) {
       auto &initial = config.initial_harts[hart];
       initial.pc = entry;
@@ -124,8 +125,10 @@ public:
       config.stream.required_producers.push_back({producer, hart_kinds});
       config.producers.push_back({producer, true, true, true, hart_kinds});
       const auto fabric = rvwmo::memory_fabric_producer_id(hart);
-      config.stream.required_producers.push_back({fabric, {rvwmo::RuntimeEventKind::StorePublish}});
-      config.producers.push_back({fabric, true, true, true, {rvwmo::RuntimeEventKind::StorePublish}});
+      const std::vector<rvwmo::RuntimeEventKind> fabric_kinds = {
+        rvwmo::RuntimeEventKind::StorePublish, rvwmo::RuntimeEventKind::AtomicLifecycle};
+      config.stream.required_producers.push_back({fabric, fabric_kinds});
+      config.producers.push_back({fabric, true, true, true, fabric_kinds});
     }
     config.reference_store_observer = [this](const rvwmo::ReferenceStoreValue &store) {
       auto result = source_->audit_reference_store(store);
