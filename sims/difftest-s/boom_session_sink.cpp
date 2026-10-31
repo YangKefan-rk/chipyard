@@ -85,7 +85,8 @@ public:
     source_config.checked_ram_base = ram_base;
     source_config.checked_ram_size = ram_size;
     source_config.skip_device_stores = tohost_address_ != 0;
-    source_config.check_csr_post = tohost_address_ != 0;
+    source_config.check_csr_post = tohost_address_ != 0 || terminal_pc_ != 0;
+    source_config.check_fp_post = tohost_address_ != 0 || terminal_pc_ != 0;
     source_config.entry_pcs.assign(layout->harts, entry);
     // Exact native Small BOOM V4 profile: ROB32/LDQ8/STQ8. Other configurations
     // require their real capacity metadata rather than the adapter maximums.
@@ -103,6 +104,7 @@ public:
     config.reference_profile = DIFFTEST_REF_PROFILE_ID_BOOM;
     config.initial_harts.resize(layout->harts);
     initialized_registers_.resize(layout->harts);
+    initialized_fpr_.resize(layout->harts);
     submitted_markers_.resize(layout->harts);
     parked_harts_.resize(layout->harts);
     const std::vector<rvwmo::RuntimeEventKind> hart_kinds = {
@@ -311,6 +313,7 @@ private:
     return {};
   }
   std::vector<std::array<bool, 32>> initialized_registers_;
+  std::vector<std::array<bool, 32>> initialized_fpr_;
 
   CheckResult complete_terminal() {
     if (completed_)
@@ -358,6 +361,7 @@ private:
       if (!result)
         return result;
       auto &initialized = initialized_registers_[retirement.id.hart];
+      auto &initialized_fp = initialized_fpr_[retirement.id.hart];
       const bool certified_csr = (retirement.instruction & 0x7f) == 0x73 &&
           retirement.csr_post && retirement.csr_post->first == (retirement.instruction >> 20);
       for (const auto reg : dependencies.sources) {
@@ -365,13 +369,18 @@ private:
           continue;
         // A certified CSR retirement compares its physical post-state with REF;
         // only GPRs need an independent entry value before that comparison.
-        if (reg >= initialized.size() && certified_csr)
+        if (reg >= 32 && reg < 64 && retirement.fp_post && initialized_fp[reg - 32])
           continue;
-        return {CheckStatus::Unsupported, 0, "entry program reads an uninitialized register or uncertified CSR"};
+        if (reg >= 64 && certified_csr)
+          continue;
+        return {CheckStatus::Unsupported, 0, "entry program reads an uninitialized GPR, FPR or uncertified CSR"};
       }
-      for (const auto reg : dependencies.destinations)
+      for (const auto reg : dependencies.destinations) {
         if (reg < initialized.size())
           initialized[reg] = true;
+        else if (reg < 64 && retirement.fp_post)
+          initialized_fp[reg - 32] = true;
+      }
     }
     return {};
   }

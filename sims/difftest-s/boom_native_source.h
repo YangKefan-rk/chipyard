@@ -29,6 +29,7 @@ struct BoomNativeSourceConfiguration {
   uint64_t checked_ram_size = 0;
   bool skip_device_stores = false;
   bool check_csr_post = false;
+  bool check_fp_post = false;
   rvwmo::boom::AdapterLimits limits;
   size_t staged_events = 65536;
 };

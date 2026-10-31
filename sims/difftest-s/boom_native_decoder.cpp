@@ -184,6 +184,16 @@ struct CsrPostFields : RecordFields {
   }
 };
 
+
+struct FpPostFields : RecordFields {
+  NativeField pc, fcsr, mstatus;
+  FpPostFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), pc(fields.field(path + ".bits.pc")),
+        fcsr(fields.field(path + ".bits.fcsr")), mstatus(fields.field(path + ".bits.mstatus")) {}
+  boom::NativeFpPost read(const Sample &sample) const {
+    return {identity.read(sample), cycle.read(sample), pc.read(sample), fcsr.read(sample), mstatus.read(sample)};
+  }
+};
 struct WfiParkFields {
   NativeField valid, cycle, csr_wait, rob_only_entry, interrupt_pending, writeback_active;
   NativeField marker_pc, marker_instruction, marker_architectural;
@@ -269,6 +279,7 @@ struct BoomNativeDecoder::Fields {
   std::optional<WfiParkFields> wfi;
   std::optional<CsrPostFields> csr_post;
   std::optional<CsrPostFields> csr_write_post;
+  std::vector<FpPostFields> fp_post;
   std::vector<DeviceStoreFields> mmio_requests, mmio_acks;
 
   Fields(const NativeProbeLayout &source, BoomPublicationSource publications)
@@ -302,6 +313,8 @@ struct BoomNativeDecoder::Fields {
       csr_post.emplace(metadata, "core.csr_post");
     if (metadata.has_field("core.csr_write_post.valid"))
       csr_write_post.emplace(metadata, "core.csr_write_post");
+    if (metadata.has_field("core.fp_post[0].valid"))
+      fp_post = vector_fields<FpPostFields>(metadata, "core.fp_post");
     const bool requests = metadata.has_field("cache.mmio_request[0].valid");
     const bool acknowledgments = metadata.has_field("cache.mmio_ack[0].valid");
     if (requests != acknowledgments)
@@ -337,6 +350,16 @@ struct BoomNativeDecoder::Fields {
       frame.csr_post = observation;
     }
     frame.csr_write_probe_available = csr_write_post.has_value();
+    frame.fp_probe_available = !fp_post.empty();
+    for (const auto &field : fp_post) {
+      if (!field.valid.read(sample))
+        continue;
+      auto observation = field.read(sample);
+      if (!observation.source_cycle || observation.source_cycle == UINT64_MAX ||
+          observation.source_cycle + 1 != frame.cycle)
+        throw std::invalid_argument("BOOM FP observation is not one cycle after its retired owner");
+      frame.fp_posts.push_back(observation);
+    }
     if (csr_write_post && csr_write_post->valid.read(sample)) {
       auto observation = csr_write_post->read(sample);
       if (!observation.source_cycle || observation.source_cycle == UINT64_MAX ||
