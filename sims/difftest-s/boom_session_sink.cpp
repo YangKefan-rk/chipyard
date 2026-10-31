@@ -84,6 +84,7 @@ public:
     source_config.terminal_pc = terminal_pc_;
     source_config.checked_ram_base = ram_base;
     source_config.checked_ram_size = ram_size;
+    source_config.skip_device_stores = tohost_address_ != 0;
     source_config.entry_pcs.assign(layout->harts, entry);
     // Exact native Small BOOM V4 profile: ROB32/LDQ8/STQ8. Other configurations
     // require their real capacity metadata rather than the adapter maximums.
@@ -94,8 +95,10 @@ public:
 
     rvwmo::HostSessionConfiguration config;
     config.platform = "boom";
-    config.verification_scope =
-        "initialized DRAM-entry scalar RAM; boot ROM, bootstrap CSR/MMIO/traps are uncovered";
+    config.verification_scope = tohost_address_
+        ? "initialized DRAM-entry scalar RAM; own-hart CLINT device stores skipped without value or I/O-order verification; boot ROM uncovered"
+        : "initialized DRAM-entry scalar RAM; boot ROM, bootstrap CSR/MMIO/traps are uncovered";
+    config.skip_device_stores = tohost_address_ != 0;
     config.reference_profile = DIFFTEST_REF_PROFILE_ID_BOOM;
     config.initial_harts.resize(layout->harts);
     initialized_registers_.resize(layout->harts);

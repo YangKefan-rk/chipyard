@@ -4,6 +4,7 @@
 #include "boom_native_decoder.h"
 #include <map>
 #include <optional>
+#include <set>
 
 namespace difftest_s::native {
 
@@ -26,6 +27,7 @@ struct BoomNativeSourceConfiguration {
   // need a separate MMIO protocol and must not enter scalar LocalStore.
   uint64_t checked_ram_base = 0;
   uint64_t checked_ram_size = 0;
+  bool skip_device_stores = false;
   rvwmo::boom::AdapterLimits limits;
   size_t staged_events = 65536;
 };
@@ -53,6 +55,9 @@ private:
   std::vector<uint64_t> entry_uids_;
   std::vector<uint64_t> watermarks_;
   std::vector<UncheckedBootstrap> bootstrap_;
+  std::map<rvwmo::OperationId, uint32_t> device_requests_;
+  std::set<rvwmo::OperationId> device_acks_;
+  std::set<rvwmo::OperationId> skipped_device_stores_;
   std::vector<BoomTerminalFacts> terminal_facts_;
   std::vector<BoomWfiParkFacts> wfi_park_facts_;
   std::vector<std::optional<rvwmo::boom::ProbeInstruction>> terminal_retirements_;

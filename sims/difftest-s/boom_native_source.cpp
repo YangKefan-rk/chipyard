@@ -124,6 +124,7 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
       config.staged_events = configuration_.staged_events;
       config.checked_ram_base = configuration_.checked_ram_base;
       config.checked_ram_size = configuration_.checked_ram_size;
+      config.skip_device_stores = configuration_.skip_device_stores;
       collectors_[hart] = std::make_unique<boom::NativeCollector>(config);
     }
     if (!entry_uids_[hart]) {
@@ -147,11 +148,31 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
         ++bootstrap_[hart].mmio_store_acks;
       continue;
     }
-    // TL A acceptance and a TL D ACK are not a RAM StorePublish or a REF
-    // device audit. Every in-scope MMIO effect still requires an independent
-    // REF trace matched to the exact retired UID, physical bytes and ACK.
-    return {CheckStatus::Unsupported, 0,
-            "BOOM uncached TL store awaits independent REF MMIO/device audit"};
+    // LinkNan-style opt-in: this device write is outside coherent RAM and
+    // REF value comparison, but source identity and TL A/D delivery must close.
+    if (!configuration_.skip_device_stores)
+      return {CheckStatus::Unsupported, 0, "BOOM uncached TL store awaits device policy"};
+    const uint64_t own_timer = UINT64_C(0x02004000) + 8 * hart;
+    if (device.address != own_timer || device.mem_size != 3 ||
+        device.byte_mask != UINT8_MAX || (device.request && device.tl_mask != UINT8_MAX) ||
+        device.denied || device.corrupt)
+      return {CheckStatus::Unsupported, 0,
+              "BOOM device-store skip rejected physical request/ACK: hart=" + std::to_string(hart) +
+              " uid=" + std::to_string(device.identity.uid) + " address=" + std::to_string(device.address) +
+              " mem_size=" + std::to_string(device.mem_size) + " mask=" + std::to_string(device.byte_mask) +
+              " tl_mask=" + std::to_string(device.tl_mask) + " denied=" + std::to_string(device.denied) +
+              " corrupt=" + std::to_string(device.corrupt)};
+    const rvwmo::OperationId id{hart, device.identity.epoch, device.identity.uid, 0};
+    if (device.request) {
+      if (!device_requests_.emplace(id, device.tl_source).second)
+        return invalid("BOOM device-store skip repeats a TL A request identity");
+    } else {
+      auto request = device_requests_.find(id);
+      if (request == device_requests_.end() || request->second != device.tl_source ||
+          !device_acks_.insert(id).second)
+        return invalid("BOOM device-store skip has no matching unique TL A/D identity");
+      device_requests_.erase(request);
+    }
   }
   select_entry_scope(frame, entry_uids_[hart]);
   if (configuration_.terminal_pc) {
@@ -180,6 +201,18 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
     }
   }
   const auto captured = collectors_[hart]->capture(frame);
+  if (captured.accepted && configuration_.skip_device_stores)
+    for (const auto &store : frame.local_stores) {
+      if (store.address >= configuration_.checked_ram_base &&
+          store.address < configuration_.checked_ram_base + configuration_.checked_ram_size)
+        continue;
+      if (store.address != UINT64_C(0x02004000) + 8 * hart ||
+          store.log2_size != 3 || store.byte_mask != UINT8_MAX)
+        return {CheckStatus::Unsupported, 0, "BOOM skipped local store is not this hart's full-width CLINT timer write"};
+      const rvwmo::OperationId id{hart, store.identity.epoch, store.identity.uid, 0};
+      if (!skipped_device_stores_.insert(id).second)
+        return invalid("BOOM device-store skip repeats a local store identity");
+    }
   if (!captured.accepted)
     return captured.check.status == CheckStatus::Pending
                ? incomplete("BOOM source collector could not accept its complete native frame") : captured.check;
@@ -280,6 +313,8 @@ CheckResult BoomNativeSource::completion() const {
           facts.writeback_active || facts.interrupt_pending || facts.source_cycle != *captured_cycle_)
         return incomplete("BOOM terminal retirement or current physical core drain is incomplete");
     }
+  if (configuration_.skip_device_stores && (!device_requests_.empty() || device_acks_ != skipped_device_stores_))
+    return incomplete("BOOM skipped device stores lack paired physical request and ACK evidence");
   for (const auto &collector : collectors_) {
     if (!collector)
       return incomplete("BOOM native hart never entered its independently initialized checked scope");
