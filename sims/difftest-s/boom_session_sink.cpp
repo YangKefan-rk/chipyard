@@ -85,6 +85,7 @@ public:
     source_config.checked_ram_base = ram_base;
     source_config.checked_ram_size = ram_size;
     source_config.skip_device_stores = tohost_address_ != 0;
+    source_config.check_csr_post = tohost_address_ != 0;
     source_config.entry_pcs.assign(layout->harts, entry);
     // Exact native Small BOOM V4 profile: ROB32/LDQ8/STQ8. Other configurations
     // require their real capacity metadata rather than the adapter maximums.
@@ -357,9 +358,17 @@ private:
       if (!result)
         return result;
       auto &initialized = initialized_registers_[retirement.id.hart];
-      for (const auto reg : dependencies.sources)
-        if (reg >= initialized.size() || !initialized[reg])
-          return {CheckStatus::Unsupported, 0, "entry program reads a register outside its independently initialized state"};
+      const bool certified_csr = (retirement.instruction & 0x7f) == 0x73 &&
+          retirement.csr_post && retirement.csr_post->first == (retirement.instruction >> 20);
+      for (const auto reg : dependencies.sources) {
+        if (reg < initialized.size() && initialized[reg])
+          continue;
+        // A certified CSR retirement compares its physical post-state with REF;
+        // only GPRs need an independent entry value before that comparison.
+        if (reg >= initialized.size() && certified_csr)
+          continue;
+        return {CheckStatus::Unsupported, 0, "entry program reads an uninitialized register or uncertified CSR"};
+      }
       for (const auto reg : dependencies.destinations)
         if (reg < initialized.size())
           initialized[reg] = true;

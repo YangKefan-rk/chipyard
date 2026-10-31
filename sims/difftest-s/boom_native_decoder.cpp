@@ -172,6 +172,18 @@ struct DeviceStoreFields : RecordFields {
   }
 };
 
+struct CsrPostFields : RecordFields {
+  NativeField pc, value, address;
+  CsrPostFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), pc(fields.field(path + ".bits.pc")),
+        value(fields.field(path + ".bits.value")),
+        address(fields.field(path + ".bits.address")) {}
+  boom::NativeCsrPost read(const Sample &sample) const {
+    return {identity.read(sample), cycle.read(sample), pc.read(sample), value.read(sample),
+            static_cast<uint16_t>(address.read(sample))};
+  }
+};
+
 struct WfiParkFields {
   NativeField valid, cycle, csr_wait, rob_only_entry, interrupt_pending, writeback_active;
   NativeField marker_pc, marker_instruction, marker_architectural;
@@ -255,6 +267,8 @@ struct BoomNativeDecoder::Fields {
   NativeField terminal_writeback, terminal_interrupt, terminal_cycle, marker_cycle, marker_pc, marker_instruction;
   IdentityFields marker_identity;
   std::optional<WfiParkFields> wfi;
+  std::optional<CsrPostFields> csr_post;
+  std::optional<CsrPostFields> csr_write_post;
   std::vector<DeviceStoreFields> mmio_requests, mmio_acks;
 
   Fields(const NativeProbeLayout &source, BoomPublicationSource publications)
@@ -284,6 +298,10 @@ struct BoomNativeDecoder::Fields {
         marker_identity(metadata, "core.terminal.marker.identity") {
     if (metadata.has_field("core.wfi_park.valid"))
       wfi.emplace(metadata, "core.wfi_park");
+    if (metadata.has_field("core.csr_post.valid"))
+      csr_post.emplace(metadata, "core.csr_post");
+    if (metadata.has_field("core.csr_write_post.valid"))
+      csr_write_post.emplace(metadata, "core.csr_write_post");
     const bool requests = metadata.has_field("cache.mmio_request[0].valid");
     const bool acknowledgments = metadata.has_field("cache.mmio_ack[0].valid");
     if (requests != acknowledgments)
@@ -310,6 +328,22 @@ struct BoomNativeDecoder::Fields {
     capture_current(sample, frame.cycle, nack, frame.cancellations);
     capture_current(sample, frame.cycle, local_store, frame.local_stores);
     capture_current(sample, frame.cycle, retire, frame.retirements);
+    frame.csr_probe_available = csr_post.has_value();
+    if (csr_post && csr_post->valid.read(sample)) {
+      auto observation = csr_post->read(sample);
+      if (!observation.source_cycle || observation.source_cycle == UINT64_MAX ||
+          observation.source_cycle + 1 != frame.cycle)
+        throw std::invalid_argument("BOOM CSR observation is not one cycle after its retired owner");
+      frame.csr_post = observation;
+    }
+    frame.csr_write_probe_available = csr_write_post.has_value();
+    if (csr_write_post && csr_write_post->valid.read(sample)) {
+      auto observation = csr_write_post->read(sample);
+      if (!observation.source_cycle || observation.source_cycle == UINT64_MAX ||
+          observation.source_cycle + 1 != frame.cycle)
+        throw std::invalid_argument("BOOM counter CSR sample is not one cycle after the accepted write");
+      frame.csr_write_post = observation;
+    }
     capture_current(sample, frame.cycle, squash, frame.squashes);
     for (const auto &field : complete)
       if (field.valid.read(sample))
