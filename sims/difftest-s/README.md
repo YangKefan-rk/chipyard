@@ -101,10 +101,10 @@ make -f ../difftest-s/Makefile CONFIG=QuadRocketDifftestSConfig \
   DIFFTEST_S_SPIKE_LIBRARY=/absolute/path/to/build/rocket-ref/riscv64-spike-ref-api.so
 ```
 
-Both checkouts must contain the revisions listed above. Set `DIFFTEST_S_ELF`
-and the terminal settings below from each ELF when running the resulting
-four-hart simulator; a compiled binary or a ROM-only run is not an acceptance
-result.
+Both checkouts must contain the revisions listed above. At run time, set
+`DIFFTEST_S_ELF` to the same ELF supplied to the native simulator and choose
+exactly one Rocket terminal mode below. A compiled binary or a ROM-only run is
+not an acceptance result.
 
 To exercise merged pending stores, use `CONFIG=QuadRocketMergeDifftestSConfig`
 with the same Rocket reference profile. The default Rocket configuration uses
@@ -165,19 +165,37 @@ retirement, architectural comparison and physical drain are separate checks.
 PCs and expected values must be derived for each ELF rather than copied from
 another program.
 
-Rocket uses a different terminal contract. Set `DIFFTEST_S_START_AT_ELF=1` and
-all five settings together:
+Rocket has **two mutually exclusive terminal modes**, both requiring
+`DIFFTEST_S_START_AT_ELF=1` and `DIFFTEST_S_ELF` to name the tested ELF:
 
-- `DIFFTEST_S_TERMINAL_PC`: PC of the canonical WFI (`0x10500073`).
-- `DIFFTEST_S_TERMINAL_SIGNATURE_ADDRESS` and
-  `DIFFTEST_S_TERMINAL_SIGNATURE_VALUE`: independent success signature.
-- `DIFFTEST_S_TERMINAL_TOHOST_ADDRESS` and
-  `DIFFTEST_S_TERMINAL_TOHOST_SUCCESS_VALUE`: independent tohost success word.
+1. Explicit WFI contract: set all five settings together:
+   `DIFFTEST_S_TERMINAL_PC` (canonical WFI `0x10500073`),
+   `DIFFTEST_S_TERMINAL_SIGNATURE_ADDRESS`,
+   `DIFFTEST_S_TERMINAL_SIGNATURE_VALUE`,
+   `DIFFTEST_S_TERMINAL_TOHOST_ADDRESS`, and
+   `DIFFTEST_S_TERMINAL_TOHOST_SUCCESS_VALUE`. The addresses must be nonzero
+   and distinct, and both expected values nonzero. Derive them independently
+   for each ELF.
+2. Native four-hart HartBreaker contract: set
+   `DIFFTEST_S_HARTBREAKER_BOOTSTRAP=1` and
+   `DIFFTEST_S_HARTBREAKER_TERMINAL=1`, **without any of the five explicit
+   terminal settings**. The host validates the exact quadrocket completion
+   block and its `semaphore_1`/`tohost` symbols against independently loaded
+   ELF bytes; an unrecognized or ambiguous layout fails closed. For example:
 
-The two addresses must be nonzero and distinct; both expected values must be
-nonzero. Completion additionally requires actual WFI, pipeline, cache,
-writeback and wake-state evidence. A park loop, a WFI instruction or a RAM
-signature alone does not establish completion.
+   ```sh
+   ELF=/absolute/path/to/hartbreaker-output/manyelfs/quadrocket_59000000.elf
+   env DIFFTEST_S_ELF="$ELF" DIFFTEST_S_START_AT_ELF=1 \
+     DIFFTEST_S_HARTBREAKER_BOOTSTRAP=1 DIFFTEST_S_HARTBREAKER_TERMINAL=1 \
+     /absolute/path/to/simulator-chipyard.harness-QuadRocketDifftestSConfig \
+     +permissive +max-cycles=500000 +loadmem="$ELF" +permissive-off "$ELF"
+   ```
+
+Both modes require observed terminal retirement and producer drain; a park
+loop, a WFI instruction or a RAM signature alone does not establish completion.
+The HartBreaker terminal accepts only the currently recognized quadrocket
+layout and optionally bounds source drain with
+`DIFFTEST_S_HARTBREAKER_DRAIN_CYCLES` (default 8192).
 
 A successful run must exit zero and emit exactly one `DIFFTEST_S_FINAL` report
 with verdict `Pass`, all four harts checked and all required producers drained.
@@ -189,8 +207,8 @@ read snapshots are compared against independently stepped Spike. Floating-point
 load/store encodings are still rejected by the public memory consumer, so FP
 memory and its PPO are **not** certified by an architecture-only Pass.
 Aligned cached-RAM AMO.W/D is supported when the SRAM old value, independent
-reference write and physical store drain are all qualified. This
-does not extend to LR/SC or generic AMOs with missing source evidence; vector,
+reference write and physical store drain are all qualified. This does not
+extend to LR/SC or generic AMOs with missing source evidence; vector,
 split, MMIO, traps and interrupts remain outside this acceptance scope.
 
 ### Optional HartBreaker entry checkpoint
@@ -213,11 +231,11 @@ scope. A changed prefix, unknown entry, or unknown hart is rejected.
 
 This option does not enable arbitrary HartBreaker ELFs: uninitialized CSR
 dependencies, FP memory, LR/SC, AMOs outside the qualified aligned cached-RAM
-scope, and terminal patterns other than the configured five-field contract
-still need independent modeling. A successful prefix checkpoint is not a
-Difftest-S Pass; an unsupported suffix remains `Unsupported` or `Incomplete`.
-The default profile
-and terminal contract are unchanged when the option is unset.
+scope, and terminal patterns other than the explicit WFI or recognized
+quadrocket contracts still need independent modeling. A successful prefix
+checkpoint is not a Difftest-S Pass; an unsupported suffix remains
+`Unsupported` or `Incomplete`. The default profile and terminal contract are
+unchanged when the option is unset.
 
 The current Rocket HartBreaker acceptance corpus uses the four-hart
 `quadrocket` design, a separate generator profile with `EXCEPTION=0`,
@@ -227,10 +245,12 @@ The current Rocket HartBreaker acceptance corpus uses the four-hart
 `HARTATTACK_DATADIR` to an external output directory; do not place generated
 ELFs or reports inside production checkouts. These choices constrain
 **generated inputs**, not the checker: every accepted retirement still needs
-independent REF values, PPO/order checks and terminal drain. HartBreaker's stock profile or its
-interrupt-fuzzing mode may generate trap and CLINT cases outside this
-acceptance scope. Inspect the per-ELF terminal PC, success signature and
-tohost symbols; never reuse another ELF's terminal values.
+independent REF values, PPO/order checks and terminal drain. HartBreaker's
+stock profile or interrupt-fuzzing mode may generate trap and CLINT cases
+outside this acceptance scope. When using the explicit WFI contract, derive
+all five settings independently from the ELF; never reuse another ELF's
+terminal values. The native HartBreaker mode validates its exact completion
+block, `semaphore_1` and `tohost` directly from the loaded ELF instead.
 
 ## Observation transport
 
