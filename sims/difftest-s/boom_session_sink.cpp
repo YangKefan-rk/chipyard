@@ -50,8 +50,10 @@ public:
 
     const char *mode = std::getenv("DIFFTEST_S_BOOM_TERMINAL_MODE");
     if (mode && *mode) {
-      if (std::string(mode) != "hartbreaker-tohost-v1")
+      const std::string terminal_mode(mode);
+      if (terminal_mode != "hartbreaker-tohost-v1" && terminal_mode != "hartbreaker-tohost-wfi-v1")
         throw std::invalid_argument("unknown BOOM terminal mode");
+      adapted_wfi_terminal_ = terminal_mode == "hartbreaker-tohost-wfi-v1";
       const char *expected = std::getenv("DIFFTEST_S_BOOM_TOHOST_SUCCESS_VALUE");
       if (!expected || !*expected)
         throw std::invalid_argument("HartBreaker terminal needs an independent expected tohost value");
@@ -65,6 +67,13 @@ public:
       const auto terminal = resolve_hartbreaker_terminal(elf, memory_);
       tohost_address_ = terminal.tohost;
       parked_wfi_pc_ = terminal.parked_wfi;
+      if (adapted_wfi_terminal_) {
+        if (terminal.success_wfi_pcs.empty())
+          throw std::invalid_argument("adapted HartBreaker ELF has no independently verified success-tail WFI");
+        success_wfi_pcs_ = std::move(terminal.success_wfi_pcs);
+        terminal_wfi_pcs_ = success_wfi_pcs_;
+        terminal_wfi_pcs_.push_back(parked_wfi_pc_);
+      }
     }
     terminal_pc_ = configured_number("DIFFTEST_S_BOOM_TERMINAL_PC", 0);
     if (tohost_address_ && terminal_pc_)
@@ -82,6 +91,7 @@ public:
     }
     BoomNativeSourceConfiguration source_config;
     source_config.terminal_pc = terminal_pc_;
+    source_config.terminal_wfi_pcs = terminal_wfi_pcs_;
     source_config.checked_ram_base = ram_base;
     source_config.checked_ram_size = ram_size;
     source_config.skip_device_stores = tohost_address_ != 0;
@@ -107,6 +117,7 @@ public:
     initialized_fpr_.resize(layout->harts);
     submitted_markers_.resize(layout->harts);
     parked_harts_.resize(layout->harts);
+    success_stores_.resize(layout->harts);
     const std::vector<rvwmo::RuntimeEventKind> hart_kinds = {
       rvwmo::RuntimeEventKind::InstructionAllocate, rvwmo::RuntimeEventKind::InstructionRetire,
       rvwmo::RuntimeEventKind::InstructionCancelAttempt, rvwmo::RuntimeEventKind::InstructionSquash,
@@ -145,6 +156,9 @@ public:
       // Each hart has a termination loop. Audit every success store; the
       // first observed owner is only a terminal-progress hint, not a unique
       // winner or a substitute for physical drain.
+      if (store.id.hart >= success_stores_.size())
+        return CheckResult{CheckStatus::Invalid, 0, "HartBreaker tohost store has an unknown hart"};
+      success_stores_[store.id.hart] = store.id;
       if (!first_tohost_store_)
         first_tohost_store_ = store.id;
       return result;
@@ -213,6 +227,15 @@ public:
           result = terminal;
         }
       }
+      if (result && adapted_wfi_terminal_) {
+        auto terminal = complete_wfi_terminal();
+        if (terminal) {
+          completed_ = true;
+          Verilated::gotFinish(true);
+        } else if (terminal.status != CheckStatus::Incomplete && terminal.status != CheckStatus::Pending) {
+          result = terminal;
+        }
+      }
     }
     if (!result && result.status != CheckStatus::Pending) {
       failure_ = result;
@@ -243,15 +266,15 @@ public:
         static_cast<unsigned long long>(outside.mmio_store_requests),
         static_cast<unsigned long long>(outside.mmio_store_acks));
     }
-    // Native HTIF may call $finish on the first tohost publication. HartBreaker
-    // keeps the winning hart in a repeated store/jump loop; that alone cannot
-    // prove that its younger instructions stopped or all harts physically drain.
-    // Until the RTL supplies that witness, the original ELF cannot be a Pass.
-    if (tohost_address_ && failure_) {
+    // Native HTIF may call $finish on the first tohost publication. Only the
+    // explicitly adapted profile may complete after four current physical WFI
+    // stalls, all REF steps and all native store/cache effects have drained.
+    if (tohost_address_ && failure_ && !completed_) {
       const auto parked = std::count_if(parked_harts_.begin(), parked_harts_.end(),
           [](const auto &marker) { return marker.has_value(); });
       session_->report_source_failure({CheckStatus::Incomplete, 0,
           !first_tohost_store_ ? "HartBreaker has no audited retiring tohost success store" :
+          adapted_wfi_terminal_ ? "adapted HartBreaker four-hart WFI stop or physical drain is unproven" :
           parked != parked_harts_.size() - 1 || parked_harts_[first_tohost_store_->hart]
             ? "HartBreaker first success and other WFI parking boundaries are unproven"
             : "HartBreaker first success stop and four-hart physical drain are unproven"});
@@ -270,6 +293,10 @@ private:
   uint64_t terminal_pc_ = 0;
   uint64_t success_address_ = 0, success_value_ = 0;
   uint64_t tohost_address_ = 0, tohost_success_value_ = 0, parked_wfi_pc_ = 0;
+  bool adapted_wfi_terminal_ = false;
+  std::vector<uint64_t> terminal_wfi_pcs_;
+  std::vector<uint64_t> success_wfi_pcs_;
+  std::vector<std::optional<rvwmo::OperationId>> success_stores_;
   std::optional<rvwmo::OperationId> first_tohost_store_;
   bool completed_ = false;
   struct SubmittedTerminalMarker { rvwmo::OperationId id; uint64_t source_cycle; };
@@ -278,6 +305,7 @@ private:
     rvwmo::OperationId id;
     uint64_t rob_generation = 0;
     uint64_t source_cycle = 0;
+    uint64_t pc = 0;
   };
   std::vector<std::optional<ParkedWfiObservation>> parked_harts_;
 
@@ -304,20 +332,74 @@ private:
       }
       if (parked_harts_[hart] && (!park.valid || park.marker.uid != parked_harts_[hart]->id.uid ||
                                   park.marker.epoch != parked_harts_[hart]->id.epoch ||
-                                  park.marker.rob_generation != parked_harts_[hart]->rob_generation))
+                                  park.marker.rob_generation != parked_harts_[hart]->rob_generation ||
+                                  park.marker_pc != parked_harts_[hart]->pc))
         return {CheckStatus::Incomplete, 0, "HartBreaker parked WFI woke or changed its ROB identity"};
       if (!park.valid)
         continue;
-      if (park.marker_pc != parked_wfi_pc_ || park.marker_instruction != 0x10500073)
-        return {CheckStatus::Invalid, 0, "BOOM physical WFI does not match the independent ELF parking loop"};
+      const bool expected_pc = adapted_wfi_terminal_
+          ? std::find(terminal_wfi_pcs_.begin(), terminal_wfi_pcs_.end(), park.marker_pc) != terminal_wfi_pcs_.end()
+          : park.marker_pc == parked_wfi_pc_;
+      if (!expected_pc || park.marker_instruction != 0x10500073)
+        return {CheckStatus::Invalid, 0, "BOOM physical WFI is not an independently verified ELF terminal"};
       if (!parked_harts_[hart])
         parked_harts_[hart] = ParkedWfiObservation{{hart, park.marker.epoch, park.marker.uid, 0},
-                                                    park.marker.rob_generation, park.source_cycle};
+                                                    park.marker.rob_generation, park.source_cycle, park.marker_pc};
     }
     return {};
   }
   std::vector<std::array<bool, 32>> initialized_registers_;
   std::vector<std::array<bool, 32>> initialized_fpr_;
+
+  CheckResult complete_wfi_terminal() {
+    if (completed_)
+      return {};
+    if (!first_tohost_store_)
+      return {CheckStatus::Incomplete, 0, "adapted HartBreaker lacks an audited tohost success store"};
+    if (std::any_of(parked_harts_.begin(), parked_harts_.end(),
+                    [](const auto &park) { return !park.has_value(); }))
+      return {CheckStatus::Incomplete, 0, "adapted HartBreaker has not physically parked all four harts"};
+    bool success_tail_parked = false;
+    for (uint32_t hart = 0; hart < parked_harts_.size(); ++hart) {
+      const auto &park = *parked_harts_[hart];
+      const auto &store = success_stores_[hart];
+      if (store && park.id.epoch == store->epoch && park.id.uid > store->uid &&
+          std::find(success_wfi_pcs_.begin(), success_wfi_pcs_.end(), park.pc) != success_wfi_pcs_.end()) {
+        success_tail_parked = true;
+        break;
+      }
+    }
+    if (!success_tail_parked)
+      return {CheckStatus::Incomplete, 0, "adapted HartBreaker has no success-store hart physically parked at its success-tail WFI"};
+    auto result = source_->certify_wfi_terminals();
+    if (!result)
+      return result;
+    result = source_->completion();
+    if (!result)
+      return result;
+    result = session_->poll();
+    if (!result)
+      return result;
+    uint64_t tohost_word = 0;
+    if (!memory_.read(tohost_address_, &tohost_word, sizeof(tohost_word)))
+      return {CheckStatus::Invalid, 0, "adapted HartBreaker tohost is outside initialized RAM"};
+    if (tohost_word != tohost_success_value_)
+      return {CheckStatus::Violation, 0, "adapted HartBreaker physical tohost value differs from expected success"};
+    for (uint32_t hart = 0; hart < parked_harts_.size(); ++hart) {
+      result = session_->complete_hart({hart, parked_harts_[hart]->source_cycle, 0});
+      if (!result)
+        return result;
+    }
+    for (uint32_t hart = 0; hart < parked_harts_.size(); ++hart) {
+      result = session_->drain_producer({rvwmo::hart_producer_id(hart), cycle_, true, true});
+      if (!result)
+        return result;
+      result = session_->drain_producer({rvwmo::memory_fabric_producer_id(hart), cycle_, true, true});
+      if (!result)
+        return result;
+    }
+    return {};
+  }
 
   CheckResult complete_terminal() {
     if (completed_)

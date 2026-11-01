@@ -128,6 +128,7 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
       config.skip_device_stores = configuration_.skip_device_stores;
       config.check_csr_post = configuration_.check_csr_post;
       config.check_fp_post = configuration_.check_fp_post;
+      config.terminal_wfi_pcs = configuration_.terminal_wfi_pcs;
       collectors_[hart] = std::make_unique<boom::NativeCollector>(config);
     }
     if (!entry_uids_[hart]) {
@@ -310,6 +311,29 @@ CheckResult BoomNativeSource::audit_reference_store(const rvwmo::ReferenceStoreV
     return remember_failure(invalid("independent REF store audit names an inactive BOOM hart"));
   return remember_failure(collectors_[store.id.hart]->audit_reference_store(
       {store.id, store.address, store.bytes, store.byte_mask}));
+}
+
+CheckResult BoomNativeSource::certify_wfi_terminals() {
+  if (!failure_)
+    return failure_;
+  if (configuration_.terminal_wfi_pcs.empty())
+    return {CheckStatus::Unsupported, 0, "BOOM source has no independently verified WFI terminal profile"};
+  if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
+      !events_.empty() || !snapshots_.empty())
+    return incomplete("BOOM source has not delivered its final WFI-cycle event prefix");
+  for (uint32_t hart = 0; hart < collectors_.size(); ++hart) {
+    const auto &park = wfi_park_facts_[hart];
+    if (!collectors_[hart] || !park.available || !park.valid ||
+        park.source_cycle != *captured_cycle_ || !park.csr_wait || !park.rob_only_entry ||
+        park.interrupt_pending || park.writeback_active || park.marker_instruction != 0x10500073 ||
+        std::find(configuration_.terminal_wfi_pcs.begin(), configuration_.terminal_wfi_pcs.end(),
+                  park.marker_pc) == configuration_.terminal_wfi_pcs.end())
+      return incomplete("BOOM WFI terminal lacks four current matching physical ROB park witnesses");
+    auto result = collectors_[hart]->certify_parked_wfi_terminal(park.marker, park.marker_pc, park.source_cycle);
+    if (!result)
+      return result;
+  }
+  return {};
 }
 
 CheckResult BoomNativeSource::completion() const {

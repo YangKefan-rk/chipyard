@@ -3,12 +3,14 @@
 
 #include "rvwmo/memory_image.h"
 #include <elf.h>
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace difftest_s::native {
@@ -18,6 +20,7 @@ namespace difftest_s::native {
 struct HartBreakerTerminalAddresses {
   uint64_t tohost = 0;
   uint64_t parked_wfi = 0;
+  std::vector<uint64_t> success_wfi_pcs;
 };
 
 inline HartBreakerTerminalAddresses resolve_hartbreaker_terminal(const std::string &path,
@@ -86,6 +89,7 @@ inline HartBreakerTerminalAddresses resolve_hartbreaker_terminal(const std::stri
     throw std::invalid_argument("HartBreaker terminal requires valid executable ELF segments");
   const std::array<uint8_t, 8> parked_loop{{0x73, 0, 0x50, 0x10, 0x6f, 0xf0, 0xdf, 0xff}};
   uint64_t parked_wfi = 0;
+  std::vector<uint64_t> success_wfi_pcs;
   for (uint16_t index = 0; index < header.e_phnum; ++index) {
     Elf64_Phdr segment{};
     std::memcpy(&segment, bytes.data() + header.e_phoff + uint64_t(index) * sizeof(segment), sizeof(segment));
@@ -93,6 +97,37 @@ inline HartBreakerTerminalAddresses resolve_hartbreaker_terminal(const std::stri
       continue;
     if (!within(segment.p_offset, segment.p_filesz))
       throw std::invalid_argument("HartBreaker terminal has an out-of-bounds executable segment");
+    auto instruction_at = [&bytes, &segment](uint64_t offset) {
+      uint32_t instruction = 0;
+      std::memcpy(&instruction, bytes.data() + segment.p_offset + offset, sizeof(instruction));
+      return instruction;
+    };
+    // The adapted corpus changes only the jump immediately following a
+    // generator-authored success store into WFI. Check the entire known tail,
+    // not an arbitrary WFI elsewhere in the randomized test body.
+    for (uint64_t offset = 16; offset + 4 <= segment.p_filesz; offset += 2) {
+      if (instruction_at(offset) != 0x10500073)
+        continue;
+      const bool final_block = (instruction_at(offset - 16) & 0xfff) == 0xe37 &&
+          instruction_at(offset - 12) == 0x01fe0e33 &&
+          instruction_at(offset - 8) == 0x00100d13 &&
+          instruction_at(offset - 4) == 0x01ae3023;
+      const bool reduced_block = (instruction_at(offset - 16) & 0xfff) == 0xb7 &&
+          instruction_at(offset - 12) == 0x01f080b3 &&
+          instruction_at(offset - 8) == 0x00100113 &&
+          instruction_at(offset - 4) == 0x0020b023;
+      if (!final_block && !reduced_block)
+        continue;
+      if (segment.p_paddr > UINT64_MAX - offset || success_wfi_pcs.size() >= 256)
+        throw std::invalid_argument("HartBreaker adapted success WFI exceeds the bounded executable profile");
+      const uint64_t pc = segment.p_paddr + offset;
+      if (std::find(success_wfi_pcs.begin(), success_wfi_pcs.end(), pc) != success_wfi_pcs.end())
+        throw std::invalid_argument("HartBreaker adapted success WFI appears in overlapping executable segments");
+      uint32_t initialized = 0;
+      if (!memory.read(pc, &initialized, sizeof(initialized)) || initialized != 0x10500073)
+        throw std::invalid_argument("HartBreaker adapted success WFI is not independently initialized");
+      success_wfi_pcs.push_back(pc);
+    }
     for (uint64_t offset = 0; offset + parked_loop.size() <= segment.p_filesz; offset += 2) {
       if (std::memcmp(bytes.data() + segment.p_offset + offset, parked_loop.data(), parked_loop.size()))
         continue;
@@ -105,7 +140,7 @@ inline HartBreakerTerminalAddresses resolve_hartbreaker_terminal(const std::stri
   if (!parked_wfi || !memory.read(parked_wfi, initialized_loop.data(), initialized_loop.size()) ||
       initialized_loop != parked_loop)
     throw std::invalid_argument("HartBreaker WFI parking loop is not independently initialized");
-  return {address, parked_wfi};
+  return {address, parked_wfi, std::move(success_wfi_pcs)};
 }
 
 } // namespace difftest_s::native

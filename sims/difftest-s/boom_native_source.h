@@ -23,6 +23,9 @@ struct BoomNativeSourceConfiguration {
   // instructions preceding this selected scope are counted as uncovered.
   std::vector<uint64_t> entry_pcs;
   uint64_t terminal_pc = 0;
+  // Independently verified ELF locations of unretired WFI terminal delimiters.
+  // Empty for ordinary workloads and native HartBreaker infinite-loop ELFs.
+  std::vector<uint64_t> terminal_wfi_pcs;
   // Match the independently initialized GlobalMem window; non-RAM accesses
   // need a separate MMIO protocol and must not enter scalar LocalStore.
   uint64_t checked_ram_base = 0;
@@ -44,6 +47,7 @@ public:
   rvwmo::CheckResult capture(const NativeFrame &frame);
   rvwmo::CheckResult take_ready(rvwmo::boom::CollectedObservations &output);
   rvwmo::CheckResult audit_reference_store(const rvwmo::ReferenceStoreValue &store);
+  rvwmo::CheckResult certify_wfi_terminals();
   rvwmo::CheckResult completion() const;
   const std::vector<BoomTerminalFacts> &terminal_facts() const { return terminal_facts_; }
   const std::vector<BoomWfiParkFacts> &wfi_park_facts() const { return wfi_park_facts_; }
