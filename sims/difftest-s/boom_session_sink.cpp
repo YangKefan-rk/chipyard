@@ -95,6 +95,7 @@ public:
     source_config.checked_ram_base = ram_base;
     source_config.checked_ram_size = ram_size;
     source_config.skip_device_stores = tohost_address_ != 0;
+    source_config.check_entry_csr = true;
     source_config.check_csr_post = tohost_address_ != 0 || terminal_pc_ != 0;
     source_config.check_fp_post = tohost_address_ != 0 || terminal_pc_ != 0;
     source_config.entry_pcs.assign(layout->harts, entry);
@@ -112,13 +113,15 @@ public:
         : "initialized DRAM-entry scalar RAM; boot ROM, bootstrap CSR/MMIO/traps are uncovered";
     // The physical exception certificate covers trap routing and scalar CSR
     // poststate, not a complete architectural register-file readback.
-    config.verification_scope += "; synchronous trap UID/PC/cause/redirect/privilege/active-bank CSR/tval checked; inactive-bank CSR prestate and full DUT GPR/FPR trap poststate unobserved";
+    config.verification_scope += "; synchronous trap UID/PC/cause/redirect/privilege/both-bank CSR/tval checked after certified DRAM-entry CSR snapshot; full DUT GPR/FPR trap poststate unobserved";
     config.skip_device_stores = tohost_address_ != 0;
     config.reference_profile = DIFFTEST_REF_PROFILE_ID_BOOM;
     config.check_boom_traps = true;
+    config.check_boom_entry_csr = true;
     config.initial_harts.resize(layout->harts);
     initialized_registers_.resize(layout->harts);
     initialized_fpr_.resize(layout->harts);
+    entry_csr_initialized_.resize(layout->harts);
     submitted_markers_.resize(layout->harts);
     parked_harts_.resize(layout->harts);
     success_stores_.resize(layout->harts);
@@ -180,6 +183,33 @@ public:
     if (frame.reset)
       return result;
     cycle_ = frame.source_cycle;
+    // Initialize each REF from the same physical dispatch edge as its first
+    // checked ELF instruction, before the source submits that allocation.
+    if (result)
+      for (uint32_t hart = 0; hart < entry_csr_initialized_.size(); ++hart) {
+        if (entry_csr_initialized_[hart])
+          continue;
+        const auto entry = source_->entry_csr(hart);
+        if (!entry)
+          continue;
+        rvwmo::BoomEntryCsrSnapshot snapshot;
+        snapshot.identity = entry->identity;
+        snapshot.source_cycle = entry->physical.source_cycle;
+        snapshot.pc = entry->pc;
+        snapshot.privilege = entry->physical.privilege;
+        snapshot.mstatus = entry->physical.mstatus;
+        snapshot.mepc = entry->physical.mepc;
+        snapshot.mcause = entry->physical.mcause;
+        snapshot.mtval = entry->physical.mtval;
+        snapshot.sepc = entry->physical.sepc;
+        snapshot.scause = entry->physical.scause;
+        snapshot.stval = entry->physical.stval;
+        snapshot.older_drained = entry->physical.older_drained;
+        result = session_->initialize_boom_entry_csr(snapshot);
+        if (!result)
+          break;
+        entry_csr_initialized_[hart] = true;
+      }
     if (result && tohost_address_)
       result = observe_parked_wfi();
     if (result) {
@@ -357,6 +387,7 @@ private:
   }
   std::vector<std::array<bool, 32>> initialized_registers_;
   std::vector<std::array<bool, 32>> initialized_fpr_;
+  std::vector<bool> entry_csr_initialized_;
 
   CheckResult complete_wfi_terminal() {
     if (completed_)

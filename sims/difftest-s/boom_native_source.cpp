@@ -46,7 +46,8 @@ void select_entry_scope(boom::NativeFrame &frame, uint64_t entry_uid) {
 
 BoomNativeSource::BoomNativeSource(BoomNativeSourceConfiguration configuration)
     : configuration_(std::move(configuration)), collectors_(configuration_.entry_pcs.size()),
-      entry_uids_(collectors_.size()), watermarks_(collectors_.size()), bootstrap_(collectors_.size()),
+      entry_uids_(collectors_.size()), entry_csrs_(collectors_.size()),
+      watermarks_(collectors_.size()), bootstrap_(collectors_.size()),
       terminal_facts_(collectors_.size()), wfi_park_facts_(collectors_.size()),
       terminal_retirements_(collectors_.size()),
       terminal_retirement_cycles_(collectors_.size()) {
@@ -87,6 +88,9 @@ CheckResult BoomNativeSource::capture(const NativeFrame &frame) {
       result = decoders_[hart]->terminal(frame, terminal_facts_[hart]);
     if (result)
       result = decoders_[hart]->wfi_park(frame, wfi_park_facts_[hart]);
+    BoomDispatchCsrFacts dispatch_csr;
+    if (result)
+      result = decoders_[hart]->dispatch_csr(frame, dispatch_csr);
     std::vector<BoomDeviceStoreFact> device_events;
     bool device_probe_available = false;
     if (result)
@@ -95,7 +99,7 @@ CheckResult BoomNativeSource::capture(const NativeFrame &frame) {
       return remember_failure(result);
     if (!device_probe_available && !device_events.empty())
       return remember_failure(invalid("BOOM MMIO event has no complete physical probe layout"));
-    if (!(result = capture_hart(std::move(decoded), device_events)))
+    if (!(result = capture_hart(std::move(decoded), dispatch_csr, device_events)))
       return remember_failure(result);
   }
   captured_cycle_ = frame.source_cycle;
@@ -103,6 +107,7 @@ CheckResult BoomNativeSource::capture(const NativeFrame &frame) {
 }
 
 CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
+                                           const BoomDispatchCsrFacts &dispatch_csr,
                                            const std::vector<BoomDeviceStoreFact> &device_events) {
   const auto hart = frame.hart;
   if (!entry_uids_[hart]) {
@@ -120,6 +125,14 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
         continue;
       if (entry_uids_[hart])
         return invalid("BOOM native frame allocates its selected entry more than once");
+      if (configuration_.check_entry_csr) {
+        if (!dispatch_csr.available || !dispatch_csr.valid ||
+            dispatch_csr.source_cycle != frame.cycle ||
+            !allocation.identity.uid || allocation.identity.epoch != configuration_.epoch)
+          return incomplete("BOOM first DRAM allocation lacks a same-cycle physical CSR snapshot");
+        entry_csrs_[hart] = BoomEntryCsrFact{
+            {hart, allocation.identity.epoch, allocation.identity.uid, 0}, allocation.pc, dispatch_csr};
+      }
       entry_uids_[hart] = allocation.identity.uid;
       boom::NativeCollectorConfiguration config;
       config.hart = hart;
@@ -181,6 +194,19 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
         return invalid("BOOM device-store skip has no matching unique TL A/D identity");
       device_requests_.erase(request);
     }
+  }
+  if (configuration_.check_entry_csr) {
+    // Do not silently discard an older boot CSR/trap result that arrives at
+    // or after the sampled entry edge: the supposed prestate would be stale.
+    const auto older = [entry_uid = entry_uids_[hart]](const auto &post) {
+      return post && post->identity.uid < entry_uid;
+    };
+    if (older(frame.csr_post) || older(frame.csr_write_post) ||
+        older(frame.trap_post) || older(frame.trap) ||
+        std::any_of(frame.fp_posts.begin(), frame.fp_posts.end(), [&](const auto &post) {
+          return post.identity.uid < entry_uids_[hart];
+        }))
+      return incomplete("BOOM bootstrap CSR or trap effect reached the checked entry boundary");
   }
   select_entry_scope(frame, entry_uids_[hart]);
   if (frame.csr_post && frame.csr_post->identity.uid < entry_uids_[hart])

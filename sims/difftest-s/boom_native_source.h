@@ -17,6 +17,12 @@ struct UncheckedBootstrap {
   uint64_t mmio_store_acks = 0;
 };
 
+struct BoomEntryCsrFact {
+  rvwmo::OperationId identity;
+  uint64_t pc = 0;
+  BoomDispatchCsrFacts physical;
+};
+
 struct BoomNativeSourceConfiguration {
   uint64_t epoch = 1;
   // The caller independently initializes each REF at this same entry PC. Boot
@@ -31,6 +37,7 @@ struct BoomNativeSourceConfiguration {
   uint64_t checked_ram_base = 0;
   uint64_t checked_ram_size = 0;
   bool skip_device_stores = false;
+  bool check_entry_csr = false;
   bool check_csr_post = false;
   bool check_fp_post = false;
   rvwmo::boom::AdapterLimits limits;
@@ -53,12 +60,16 @@ public:
   const std::vector<BoomWfiParkFacts> &wfi_park_facts() const { return wfi_park_facts_; }
   const std::vector<UncheckedBootstrap> &unchecked_bootstrap() const { return bootstrap_; }
   uint64_t entry_uid(uint32_t hart) const { return hart < entry_uids_.size() ? entry_uids_[hart] : 0; }
+  std::optional<BoomEntryCsrFact> entry_csr(uint32_t hart) const {
+    return hart < entry_csrs_.size() ? entry_csrs_[hart] : std::nullopt;
+  }
 
 private:
   BoomNativeSourceConfiguration configuration_;
   std::vector<std::unique_ptr<BoomNativeDecoder>> decoders_;
   std::vector<std::unique_ptr<rvwmo::boom::NativeCollector>> collectors_;
   std::vector<uint64_t> entry_uids_;
+  std::vector<std::optional<BoomEntryCsrFact>> entry_csrs_;
   std::vector<uint64_t> watermarks_;
   std::vector<UncheckedBootstrap> bootstrap_;
   std::map<rvwmo::OperationId, uint32_t> device_requests_;
@@ -78,6 +89,7 @@ private:
   rvwmo::CheckResult failure_;
 
   rvwmo::CheckResult capture_hart(rvwmo::boom::NativeFrame frame,
+                                 const BoomDispatchCsrFacts &dispatch_csr,
                                  const std::vector<BoomDeviceStoreFact> &device_events);
   rvwmo::CheckResult remember_failure(rvwmo::CheckResult result);
 };

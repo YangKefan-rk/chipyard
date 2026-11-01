@@ -197,6 +197,37 @@ struct DeviceStoreFields : RecordFields {
   }
 };
 
+struct DispatchCsrFields {
+  NativeField valid, cycle, older_drained, privilege, mstatus;
+  NativeField mepc, mcause, mtval, sepc, scause, stval;
+  DispatchCsrFields(const NativeFields &fields, const std::string &path)
+      : valid(fields.field(path + ".valid")), cycle(fields.field(path + ".bits.source_cycle")),
+        older_drained(fields.field(path + ".bits.older_drained")),
+        privilege(fields.field(path + ".bits.privilege")),
+        mstatus(fields.field(path + ".bits.mstatus")),
+        mepc(fields.field(path + ".bits.mepc")), mcause(fields.field(path + ".bits.mcause")),
+        mtval(fields.field(path + ".bits.mtval")), sepc(fields.field(path + ".bits.sepc")),
+        scause(fields.field(path + ".bits.scause")), stval(fields.field(path + ".bits.stval")) {}
+  BoomDispatchCsrFacts read(const Sample &sample) const {
+    BoomDispatchCsrFacts result;
+    result.available = true;
+    result.valid = valid.read(sample);
+    if (!result.valid)
+      return result;
+    result.source_cycle = cycle.read(sample);
+    result.older_drained = older_drained.read(sample);
+    result.privilege = privilege.read(sample);
+    result.mstatus = mstatus.read(sample);
+    result.mepc = mepc.read(sample);
+    result.mcause = mcause.read(sample);
+    result.mtval = mtval.read(sample);
+    result.sepc = sepc.read(sample);
+    result.scause = scause.read(sample);
+    result.stval = stval.read(sample);
+    return result;
+  }
+};
+
 struct TrapPostFields : RecordFields {
   NativeField pc, cause, target_pc, privilege, mstatus, mepc, mcause, mtval, sepc, scause, stval;
   TrapPostFields(const NativeFields &fields, const std::string &path)
@@ -307,6 +338,7 @@ struct BoomNativeDecoder::Fields {
   NativeField hart, queues_empty, cache_idle;
   RecordFields trap;
   NativeField trap_pc, trap_cause;
+  std::optional<DispatchCsrFields> dispatch_csr;
   std::optional<TrapPostFields> trap_post;
   std::vector<InstructionFields> allocate, retire;
   std::vector<QueueFields> queues;
@@ -355,6 +387,8 @@ struct BoomNativeDecoder::Fields {
         marker_identity(metadata, "core.terminal.marker.identity") {
     if (metadata.has_field("cache.atomic_applied.valid"))
       atomic_applied.emplace(metadata, "cache.atomic_applied");
+    if (metadata.has_field("core.dispatch_csr.valid"))
+      dispatch_csr.emplace(metadata, "core.dispatch_csr");
     if (metadata.has_field("core.trap_post.valid"))
       trap_post.emplace(metadata, "core.trap_post");
     if (metadata.has_field("core.wfi_park.valid"))
@@ -512,6 +546,22 @@ rvwmo::CheckResult BoomNativeDecoder::decode(const NativeFrame &source, boom::Na
     return {rvwmo::CheckStatus::Invalid, 0, error.what()};
   }
 }
+rvwmo::CheckResult BoomNativeDecoder::dispatch_csr(
+    const NativeFrame &source, BoomDispatchCsrFacts &output) const {
+  if (!fields_->dispatch_csr) {
+    output = {};
+    return {};
+  }
+  try {
+    output = fields_->dispatch_csr->read(source.samples.at(fields_->layout->hart));
+    if (output.valid && output.source_cycle != source.source_cycle)
+      return {rvwmo::CheckStatus::Invalid, 0, "BOOM dispatch CSR sample differs from physical allocation cycle"};
+    return {};
+  } catch (const std::exception &error) {
+    return {rvwmo::CheckStatus::Invalid, 0, error.what()};
+  }
+}
+
 rvwmo::CheckResult BoomNativeDecoder::terminal(const NativeFrame &source, BoomTerminalFacts &output) const {
   try {
     const auto &sample = source.samples.at(fields_->layout->hart);

@@ -31,6 +31,15 @@ struct BoomWfiParkFacts {
   uint32_t marker_instruction = 0;
 };
 
+// CSRFile at a dispatch edge; the caller binds this to the entry allocation
+// on the same hart and cycle, never to a guessed instruction UID.
+struct BoomDispatchCsrFacts {
+  bool available = false, valid = false, older_drained = false;
+  uint64_t source_cycle = 0, privilege = 0, mstatus = 0;
+  uint64_t mepc = 0, mcause = 0, mtval = 0;
+  uint64_t sepc = 0, scause = 0, stval = 0;
+};
+
 // BOOM IOMSHR TL A/D facts are separate from L1 RAM StorePublish. A request
 // alone cannot certify a completed device effect or a successful REF step.
 struct BoomDeviceStoreFact {
@@ -48,6 +57,7 @@ public:
   ~BoomNativeDecoder();
   rvwmo::CheckResult decode(const NativeFrame &source, rvwmo::boom::NativeFrame &output) const;
 
+  rvwmo::CheckResult dispatch_csr(const NativeFrame &source, BoomDispatchCsrFacts &output) const;
   rvwmo::CheckResult terminal(const NativeFrame &source, BoomTerminalFacts &output) const;
   rvwmo::CheckResult wfi_park(const NativeFrame &source, BoomWfiParkFacts &output) const;
   rvwmo::CheckResult device_stores(const NativeFrame &source, std::vector<BoomDeviceStoreFact> &output,
