@@ -36,9 +36,32 @@ explicit build paths. The recorded BOOM four-hart acceptance cohort uses:
 | `YangKefan-rk/difftest-s` | `499c89d9504639c95846037fb8cf1976f76c097f` |
 | `YangKefan-rk/Spike` | `752638c4034e385fd910a9ea1e0e0d179ffbeea2` |
 
-Select these exact external revisions before building. Chipyard's upstream
-`toolchains/riscv-tools/riscv-isa-sim` submodule does not replace the reference
-Spike checkout selected below.
+Select these exact external revisions when reproducing that **historical BOOM**
+cohort. They are not the current Rocket/HartBreaker source set. For Rocket,
+this Chipyard revision pins Rocket `6cff31948e719aa9e2d67c4dbdb850a3e4a91978`;
+use Difftest-S `9a218abaf838` and reference Spike `45e1c427bf0e` from
+`YangKefan-rk` as separate checkouts. Generate quadrocket ELF inputs using
+`YangKefan-rk/hartbreaker` at `45a34d7040821decfe23d9d54c2710b47693ea31`
+(which includes the shared-address-register fix `4dd941acd674`). The fork provides `simulators/quadrocket/cfg.json` and
+`profiles/quadrocket-supported.toml`; select them before generating ELF files:
+
+```sh
+cd /absolute/path/to/hartbreaker
+source scripts/env.sh
+export HARTATTACK_SIMULATORS_DIR="$PWD/simulators"
+export HARTATTACK_CONFIG="$PWD/profiles/quadrocket-supported.toml"
+export HARTATTACK_DATADIR=/absolute/path/to/hartbreaker-output
+python3 hartattack/main.py quadrocket --gensingle 59000000 --num-cores 1 \
+  --authorize-privileges False --num-bbs 32
+```
+
+`--num-cores 1` selects a host generator worker, not the four target harts in
+`cfg.json`. For MCM/Dat3M inputs add `--fuzz-mcm --verify-memory-trace dat` and
+configure `DAT3M_HOME` as in the fork's `profiles/README.md`. Keep generated
+inputs and logs outside the production checkouts. These are
+source revisions and prerequisites, not a claim that any HartBreaker-generated
+ELF is supported. Chipyard's upstream `toolchains/riscv-tools/riscv-isa-sim` submodule does not replace the
+reference Spike checkout selected below.
 
 ## Build a complete session
 
@@ -62,9 +85,26 @@ make -f ../difftest-s/Makefile CONFIG=QuadSmallBoomV4DifftestSConfig \
   DIFFTEST_S_SPIKE_LIBRARY=/absolute/path/to/build/boom-ref/riscv64-spike-ref-api.so
 ```
 
-For Rocket, build Spike with `CPU=ROCKET_CHIP` in a separate output directory,
-then use `CONFIG=QuadRocketDifftestSConfig`, `DIFFTEST_S_DUT=rocket` and that
-profile's library. Do not reuse BOOM reference objects for Rocket.
+For Rocket, build its own reference library in an output directory distinct
+from BOOM and select that library explicitly; do not reuse BOOM objects:
+
+```sh
+make -C /absolute/path/to/Spike/difftest CPU=ROCKET_CHIP \
+  MULTICORE_DIFF=1 EXTERNAL_MEMORY=1 PURE_API=1 \
+  BUILD_DIR=/absolute/path/to/build/rocket-ref
+
+# From this Chipyard checkout's sims/verilator directory:
+make -f ../difftest-s/Makefile CONFIG=QuadRocketDifftestSConfig \
+  DIFFTEST_S_DUT=rocket DIFFTEST_S_SESSION=1 \
+  DIFFTEST_S_DIR=/absolute/path/to/difftest-s \
+  DIFFTEST_S_SPIKE_HOME=/absolute/path/to/Spike \
+  DIFFTEST_S_SPIKE_LIBRARY=/absolute/path/to/build/rocket-ref/riscv64-spike-ref-api.so
+```
+
+Both checkouts must contain the revisions listed above. Set `DIFFTEST_S_ELF`
+and the terminal settings below from each ELF when running the resulting
+four-hart simulator; a compiled binary or a ROM-only run is not an acceptance
+result.
 
 To exercise merged pending stores, use `CONFIG=QuadRocketMergeDifftestSConfig`
 with the same Rocket reference profile. The default Rocket configuration uses
@@ -147,9 +187,11 @@ initialized RAM prefix with explicitly decoded RV64 F/D register architecture, n
 full ISA or full RVWMO completeness. FP register arithmetic/moves and exact FCSR
 read snapshots are compared against independently stepped Spike. Floating-point
 load/store encodings are still rejected by the public memory consumer, so FP
-memory and its PPO are **not** certified by an architecture-only Pass. Generic
-AMO/LRSC, vector, split accesses, MMIO, traps and interrupts remain outside
-this acceptance scope.
+memory and its PPO are **not** certified by an architecture-only Pass.
+Aligned cached-RAM AMO.W/D is supported when the SRAM old value, independent
+reference write and physical store drain are all qualified. This
+does not extend to LR/SC or generic AMOs with missing source evidence; vector,
+split, MMIO, traps and interrupts remain outside this acceptance scope.
 
 ### Optional HartBreaker entry checkpoint
 
@@ -170,10 +212,25 @@ write and execution of that excluded prefix remain **outside** the checked
 scope. A changed prefix, unknown entry, or unknown hart is rejected.
 
 This option does not enable arbitrary HartBreaker ELFs: uninitialized CSR
-dependencies, FP memory, AMO/LRSC, and HartBreaker's native terminal behavior still
-need independent modeling. A successful prefix checkpoint is not a Difftest-S
-Pass; an unsupported suffix remains `Unsupported` or `Incomplete`. The default
-profile and terminal contract are unchanged when the option is unset.
+dependencies, FP memory, LR/SC, AMOs outside the qualified aligned cached-RAM
+scope, and terminal patterns other than the configured five-field contract
+still need independent modeling. A successful prefix checkpoint is not a
+Difftest-S Pass; an unsupported suffix remains `Unsupported` or `Incomplete`.
+The default profile
+and terminal contract are unchanged when the option is unset.
+
+The current Rocket HartBreaker acceptance corpus uses the four-hart
+`quadrocket` design, a separate generator profile with `EXCEPTION=0`,
+`--authorize-privileges False`, `--num-bbs 32`, and no
+`--fuzz-interrupts`. MCM inputs additionally use `--fuzz-mcm` and
+`--verify-memory-trace dat` and require a configured `DAT3M_HOME`. Set
+`HARTATTACK_DATADIR` to an external output directory; do not place generated
+ELFs or reports inside production checkouts. These choices constrain
+**generated inputs**, not the checker: every accepted retirement still needs
+independent REF values, PPO/order checks and terminal drain. HartBreaker's stock profile or its
+interrupt-fuzzing mode may generate trap and CLINT cases outside this
+acceptance scope. Inspect the per-ELF terminal PC, success signature and
+tohost symbols; never reuse another ELF's terminal values.
 
 ## Observation transport
 
