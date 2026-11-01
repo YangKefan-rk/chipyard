@@ -70,6 +70,7 @@ private:
   std::vector<uint64_t> terminal_retirement_cycles_;
   std::vector<rvwmo::RuntimeEvent> events_;
   std::map<rvwmo::OperationId, rvwmo::ArchitecturalRetirement> snapshots_;
+  std::map<rvwmo::OperationId, rvwmo::ArchitecturalTrap> traps_;
   std::optional<uint64_t> captured_cycle_;
   std::optional<uint64_t> closed_cycle_;
   uint64_t captured_publication_sequence_ = 0;

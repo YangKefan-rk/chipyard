@@ -197,6 +197,22 @@ struct DeviceStoreFields : RecordFields {
   }
 };
 
+struct TrapPostFields : RecordFields {
+  NativeField pc, cause, target_pc, privilege, mstatus, mepc, mcause, mtval, sepc, scause, stval;
+  TrapPostFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), pc(fields.field(path + ".bits.pc")),
+        cause(fields.field(path + ".bits.cause")), target_pc(fields.field(path + ".bits.target_pc")),
+        privilege(fields.field(path + ".bits.privilege")), mstatus(fields.field(path + ".bits.mstatus")),
+        mepc(fields.field(path + ".bits.mepc")), mcause(fields.field(path + ".bits.mcause")),
+        mtval(fields.field(path + ".bits.mtval")), sepc(fields.field(path + ".bits.sepc")),
+        scause(fields.field(path + ".bits.scause")), stval(fields.field(path + ".bits.stval")) {}
+  boom::NativeTrapPost read(const Sample &sample) const {
+    return {identity.read(sample), cycle.read(sample), pc.read(sample), cause.read(sample),
+            target_pc.read(sample), privilege.read(sample), mstatus.read(sample), mepc.read(sample),
+            mcause.read(sample), mtval.read(sample), sepc.read(sample), scause.read(sample), stval.read(sample)};
+  }
+};
+
 struct CsrPostFields : RecordFields {
   NativeField pc, value, address;
   CsrPostFields(const NativeFields &fields, const std::string &path)
@@ -255,11 +271,12 @@ struct WfiParkFields {
 };
 
 struct SquashFields : RecordFields {
-  NativeField rob;
+  NativeField rob, rollback;
   SquashFields(const NativeFields &fields, const std::string &path)
-      : RecordFields(fields, path), rob(fields.field(path + ".bits.rob_index")) {}
+      : RecordFields(fields, path), rob(fields.field(path + ".bits.rob_index")),
+        rollback(fields.field(path + ".bits.rollback")) {}
   boom::NativeSquash read(const Sample &sample) const {
-    return {identity.read(sample), static_cast<uint32_t>(rob.read(sample))};
+    return {identity.read(sample), static_cast<uint32_t>(rob.read(sample)), rollback.read(sample) != 0};
   }
 };
 
@@ -289,6 +306,8 @@ struct BoomNativeDecoder::Fields {
   NativeFields metadata;
   NativeField hart, queues_empty, cache_idle;
   RecordFields trap;
+  NativeField trap_pc, trap_cause;
+  std::optional<TrapPostFields> trap_post;
   std::vector<InstructionFields> allocate, retire;
   std::vector<QueueFields> queues;
   std::vector<AttemptFields> begin, cancel, nack, retired_load;
@@ -312,6 +331,7 @@ struct BoomNativeDecoder::Fields {
       : layout(&source), publication_source(std::move(publications)), metadata(source),
         hart(metadata.field("core.hartid")), queues_empty(metadata.field("lsu.queues_empty")),
         cache_idle(metadata.field("cache.idle")), trap(metadata, "core.trap"),
+        trap_pc(metadata.field("core.trap.bits.pc")), trap_cause(metadata.field("core.trap.bits.cause")),
         allocate(vector_fields<InstructionFields>(metadata, "core.allocate")),
         retire(vector_fields<InstructionFields>(metadata, "core.retire")),
         queues(vector_fields<QueueFields>(metadata, "lsu.allocate")),
@@ -335,6 +355,8 @@ struct BoomNativeDecoder::Fields {
         marker_identity(metadata, "core.terminal.marker.identity") {
     if (metadata.has_field("cache.atomic_applied.valid"))
       atomic_applied.emplace(metadata, "cache.atomic_applied");
+    if (metadata.has_field("core.trap_post.valid"))
+      trap_post.emplace(metadata, "core.trap_post");
     if (metadata.has_field("core.wfi_park.valid"))
       wfi.emplace(metadata, "core.wfi_park");
     if (metadata.has_field("core.csr_post.valid"))
@@ -449,9 +471,19 @@ struct BoomNativeDecoder::Fields {
             boom::StorePublicationEvidence::ExclusiveCacheDataWrite, true});
       }
     }
-    frame.trap = trap.valid.read(sample);
-    if (frame.trap)
+    frame.trap_post_probe_available = trap_post.has_value();
+    if (trap_post && trap_post->valid.read(sample)) {
+      auto observation = trap_post->read(sample);
+      if (!observation.source_cycle || observation.source_cycle > frame.cycle ||
+          frame.cycle - observation.source_cycle != 2)
+        throw std::invalid_argument("BOOM trap post-state is not two edges after its physical trap owner");
+      frame.trap_post = observation;
+    }
+    if (trap.valid.read(sample)) {
       trap.require_current(sample, frame.cycle);
+      frame.trap = boom::NativeTrap{trap.identity.read(sample), frame.cycle,
+                                    trap_pc.read(sample), trap_cause.read(sample)};
+    }
     frame.queues_empty = queues_empty.read(sample);
     frame.cache_idle = cache_idle.read(sample);
   }
