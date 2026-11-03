@@ -277,3 +277,57 @@ The scoped firtool launcher removes only annotations duplicated verbatim in
 both CHIRRTL and its sidecar JSON. The wrapper excludes the unrelated Radiance
 make fragment from these Rocket/BOOM profiles; ordinary Chipyard builds retain
 their default generator fragments.
+
+## Optional BOOM SFUZZ semantic sidecar
+
+The BOOM session can expose source-closed, checker-accepted memory facts to an
+independent seed scheduler. This opt-in export **does not** alter Difftest-S's
+reference execution or its final verdict. It writes nothing unless the
+four-hart `HostSession::finalize()` returns a complete Pass and its semantic
+observer is healthy. A missing/invalid sidecar is a feedback infrastructure
+error, not a legitimate measured interaction count of zero.
+
+The BOOM private launcher supplies the existing case-local functional identity
+`SFUZZ_FUNCTIONAL_CASE_ID`, `_RUN_ID`, `_ELF_SHA256`,
+`_SIMULATOR_SHA256` and `_OUTPUT`, plus:
+
+- `DIFFTEST_S_SEMANTIC_OUTPUT`: absolute path to `interaction-feedback.json`
+  beside the functional output in this run's native case directory;
+- `DIFFTEST_S_SEMANTIC_LAYOUT_SHA256`: SHA-256 of the independently pinned
+  `difftest-s-semantic.v1` layout manifest;
+- `DIFFTEST_S_SEMANTIC_LAST_CYCLE`: inclusive fixed source horizon. It must
+  cover all functional scoring windows and be no later than the closed source
+  prefix of any of the eight required producers.
+
+No semantic export is enabled without `DIFFTEST_S_SEMANTIC_OUTPUT`. The BOOM
+host copies raw accepted events, matches each load sample to its final retired
+attempt, filters squashed/replayed work, and keeps physical store publications
+as indivisible transactions with their actual generation and all member
+identities. It preserves the original producer cycle, phase and sequence; the
+callback order never claims a cross-hart memory order. Stores merged without
+an independently observed physical group generation cannot be scored.
+
+The case-local JSON carries `kind="difftest-s-semantic.v1"`, case/run/ELF/
+simulator/layout identities, `epoch=1`, `source_clock=
+"boom_tile_clock_posedge_pre_nba"`, a fixed roster `h0..h3,f0..f3`, all
+producer watermarks, and final `retired_load_sample` and
+`store_publish_group` rows. Each row retains original source cycle/phase/
+sequence, hart, post-translation physical byte address/mask and operation
+identity. The private adapter must hash/attest this exact artifact and confirm
+that its fixed layout's source clock, phases, physical addresses and horizon
+match the executed F probe build. A positive clock/address certification must
+not be inferred solely from a literal manifest field.
+
+Build the public source and host together against the matching Spike library:
+
+```sh
+make -C /absolute/path/to/chipyard/sims/verilator -f ../difftest-s/Makefile \
+  CONFIG=QuadSmallBoomV4DifftestSConfig DIFFTEST_S_DUT=boom \
+  DIFFTEST_S_SESSION=1 DIFFTEST_S_DIR=/absolute/path/to/difftest-s \
+  DIFFTEST_S_SPIKE_HOME=/absolute/path/to/Spike \
+  DIFFTEST_S_SPIKE_LIBRARY=/absolute/path/to/riscv64-spike-ref-api.so \
+  gen_dir=/absolute/path/to/pinned-generated-rtl sim=/absolute/path/to/simulator
+```
+
+`boom_semantic_export.cpp` is included only in this BOOM session build; Rocket,
+ordinary Chipyard simulations and existing functional probes are untouched.
