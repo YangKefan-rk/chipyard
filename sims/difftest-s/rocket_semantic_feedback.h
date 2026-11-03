@@ -23,6 +23,30 @@ class RocketSemanticFeedback {
 public:
   explicit RocketSemanticFeedback(const char *path) : path_(path && *path ? path : "") {}
   bool enabled() const { return !path_.empty(); }
+  const char *unavailable_reason() const { return unavailable_reason_; }
+
+  void bind_capabilities(const std::vector<rvwmo::ProducerCapability> &producers) noexcept {
+    if (!enabled())
+      return;
+    try {
+      for (const auto &producer : producers) {
+        if (!producer.lossless_events || !producer.provides_source_positions ||
+            !producer.provides_watermarks ||
+            !certified_producers_.insert(producer.producer_id).second) {
+          failed_ = true;
+          unavailable_reason_ = "producer_not_lossless";
+          break;
+        }
+      }
+      if (certified_producers_.size() != 8) {
+        failed_ = true;
+        unavailable_reason_ = "missing_lossless_producer";
+      }
+    } catch (...) {
+      failed_ = true;
+      unavailable_reason_ = "producer_capability_allocation";
+    }
+  }
 
   void observe(const rvwmo::RuntimeEvent &event) noexcept {
     if (!enabled() || failed_)
@@ -77,6 +101,10 @@ public:
 
 private:
   static constexpr const char *clock_ = "rocket_tile_clock_posedge_pre_nba";
+  std::optional<std::string> unavailable(const char *reason) const {
+    unavailable_reason_ = reason;
+    return std::nullopt;
+  }
   struct Effect {
     const rvwmo::RuntimeEvent *event = nullptr;
     rvwmo::MemoryOperation operation;
@@ -99,8 +127,11 @@ private:
       const std::map<uint32_t, rvwmo::SourcePosition> &marks,
       uint64_t completed_cycle, unsigned harts) const {
     using namespace rvwmo;
-    if (marks.size() != harts * 2 || events_.empty())
-      return std::nullopt;
+    if (marks.size() != harts * 2 || certified_producers_.size() != marks.size() || events_.empty())
+      return unavailable("missing_roster_or_events");
+    for (const auto &[producer, position] : marks)
+      if (!certified_producers_.count(producer))
+        return unavailable("unqualified_source_capability");
     std::map<OperationId, MemoryOperation> retired;
     std::set<std::pair<OperationId, uint32_t>> canceled;
     std::set<OperationId> squashed;
@@ -108,7 +139,7 @@ private:
     for (const auto &event : events_) {
       if (event.source.cycle > completed_cycle || event.source.qualified_phase != 0 ||
           event.source.order_qualified || !event.source.producer_sequence)
-        return std::nullopt; // A common intra-cycle order has not been qualified.
+        return unavailable("unqualified_event_position"); // A common intra-cycle order has not been qualified.
       if (event.kind == RuntimeEventKind::InstructionCancelAttempt) {
         const auto &cancel = std::get<InstructionCancelAttemptEvent>(event.payload);
         canceled.insert({cancel.id, cancel.attempt});
@@ -122,18 +153,18 @@ private:
         if (!epoch)
           epoch = instruction.epoch;
         if (*epoch != instruction.epoch || instruction.hart >= harts)
-          return std::nullopt;
+          return unavailable("retired_instruction_epoch_or_hart");
         for (const auto &operation : instruction.memory) {
           if (operation.id.hart != instruction.hart || operation.id.epoch != *epoch ||
               operation.id.uid != instruction.uid || squashed.count(operation.id) ||
               canceled.count({operation.id, operation.attempt}) ||
               !retired.emplace(operation.id, operation).second)
-            return std::nullopt;
+            return unavailable("retired_memory_identity");
         }
       }
     }
     if (!epoch || !*epoch)
-      return std::nullopt;
+      return unavailable("missing_retirement_epoch");
     std::set<OperationId> sampled_loads, published_stores;
     std::set<std::pair<uint32_t, uint64_t>> source_ids;
     std::set<std::pair<uint32_t, uint64_t>> transactions;
@@ -151,14 +182,14 @@ private:
             event.producer_id != hart_producer_id(operation.id.hart) ||
             !mask_bits(operation.byte_mask) || !sampled_loads.insert(operation.id).second ||
             !source_ids.insert({event.producer_id, event.source.producer_sequence}).second)
-          return std::nullopt;
+          return unavailable("final_load_sample_conflict");
         effects.push_back({&event, operation, {}});
       } else if (event.kind == RuntimeEventKind::StorePublish) {
         const auto &publish = std::get<StorePublishEvent>(event.payload);
         if (publish.members.empty() || !publish.transaction_id || !mask_bits(publish.byte_mask) ||
             !transactions.insert({event.producer_id, publish.transaction_id}).second ||
             !source_ids.insert({event.producer_id, event.source.producer_sequence}).second)
-          return std::nullopt;
+          return unavailable("publish_transaction_or_source_conflict");
         Effect effect;
         effect.event = &event;
         for (const auto &member : publish.members) {
@@ -167,11 +198,11 @@ private:
               found->second.id.epoch != *epoch ||
               event.producer_id != memory_fabric_producer_id(found->second.id.hart) ||
               !published_stores.insert(member.id).second)
-            return std::nullopt;
+            return unavailable("published_member_not_retired");
           effect.members.push_back(found->second);
         }
         if (publish.byte_writers.size() != publish.byte_mask.size())
-          return std::nullopt;
+          return unavailable("publication_writer_count");
         for (size_t byte = 0; byte < publish.byte_mask.size(); ++byte) {
           if (!publish.byte_mask[byte])
             continue;
@@ -179,7 +210,7 @@ private:
           const auto belongs = std::find_if(effect.members.begin(), effect.members.end(),
               [&](const auto &member) { return member.id == writer; });
           if (belongs == effect.members.end())
-            return std::nullopt;
+            return unavailable("published_byte_writer_not_member");
         }
         effects.push_back(std::move(effect));
       }
@@ -187,10 +218,10 @@ private:
     for (const auto &[id, operation] : retired) {
       if ((operation.load && !sampled_loads.count(id)) ||
           (operation.store && !published_stores.count(id)))
-        return std::nullopt;
+        return unavailable("missing_final_load_or_publish");
     }
     if (effects.empty() || effects.size() > 100000)
-      return std::nullopt;
+      return unavailable("no_bounded_memory_effects");
     for (const auto &effect : effects) {
       first = std::min(first, effect.event->source.cycle);
       last = std::max(last, effect.event->source.cycle);
@@ -199,21 +230,23 @@ private:
       for (const auto producer : {hart_producer_id(hart), memory_fabric_producer_id(hart)}) {
         const auto mark = marks.find(producer);
         if (mark == marks.end() || mark->second.cycle < last)
-          return std::nullopt;
+          return unavailable("source_watermark_before_effect");
       }
     }
     std::ostringstream output;
     output << "{\"schema_version\":1,\"kind\":\"rocket-source-closed.v1\","
            << "\"source_clock\":\"" << clock_ << "\",\"epoch\":" << *epoch
            << ",\"completed_cycle\":" << completed_cycle << ",\"first_cycle\":" << first
-           << ",\"last_cycle\":" << last << ",\"intra_cycle_order_qualified\":false,"
+           << ",\"last_cycle\":" << last << ",\"cache_line_bytes\":64,\"intra_cycle_order_qualified\":false,"
            << "\"physical_address_verified\":true,\"complete\":true,\"producer_watermarks\":[";
     bool first_mark = true;
     for (const auto &[producer, mark] : marks) {
       if (!first_mark)
         output << ',';
       first_mark = false;
-      output << "{\"producer_id\":" << producer << ",\"closed_through_cycle\":" << mark.cycle << '}';
+      output << "{\"producer_id\":" << producer << ",\"closed_through_cycle\":" << mark.cycle
+             << ",\"epoch\":" << *epoch << ",\"source_clock\":\"" << clock_
+             << "\",\"lossless\":true,\"complete\":true}";
     }
     output << "],\"events\":[";
     bool first_event = true;
@@ -258,7 +291,9 @@ private:
 
   std::string path_;
   std::vector<rvwmo::RuntimeEvent> events_;
+  std::set<uint32_t> certified_producers_;
   bool failed_ = false;
+  mutable const char *unavailable_reason_ = "none";
 };
 
 } // namespace difftest_s::native

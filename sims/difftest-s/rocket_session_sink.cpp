@@ -203,6 +203,7 @@ public:
     if (hartbreaker_bootstrap)
       mie_contract_ = std::make_unique<RocketMieContract>(layout->harts);
     if (semantic_feedback_.enabled()) {
+      semantic_feedback_.bind_capabilities(config.producers);
       config.semantic_event_observer = [this](const rvwmo::RuntimeEvent &event) {
         semantic_feedback_.observe(event);
       };
@@ -311,7 +312,7 @@ public:
     const auto effective = failure_ ? final_result_ : failure_;
     if (semantic_feedback_.enabled() &&
         !semantic_feedback_.publish(*session_, effective, cycle_, static_cast<unsigned>(decoders_.size())))
-      std::fprintf(stderr, "DIFFTEST_S_ROCKET_SEMANTIC_UNAVAILABLE\n");
+      std::fprintf(stderr, "DIFFTEST_S_ROCKET_SEMANTIC_UNAVAILABLE %s\n", semantic_feedback_.unavailable_reason());
     std::fprintf(stderr, "DIFFTEST_S_FINAL %s\n", session_->final_report().c_str());
     return effective;
   }
