@@ -3,6 +3,7 @@
 #include "rocket_hartbreaker_bootstrap.h"
 #include "rocket_hartbreaker_terminal.h"
 #include "rocket_mie_contract.h"
+#include "rocket_semantic_feedback.h"
 #include "rvwmo/dependency.h"
 #include "rvwmo/host_session.h"
 #include "rvwmo/memory_image.h"
@@ -70,7 +71,8 @@ RocketTerminalProgramContract terminal_program_contract() {
 
 class RocketSessionSink {
 public:
-  explicit RocketSessionSink(const char *elf) {
+  explicit RocketSessionSink(const char *elf)
+      : semantic_feedback_(std::getenv("DIFFTEST_S_ROCKET_SEMANTIC_TRACE")) {
     const auto *layout = find_native_layout(1, 0);
     if (!layout)
       throw std::invalid_argument("Rocket Runtime sink requires matching generated native layouts");
@@ -200,6 +202,11 @@ public:
     }
     if (hartbreaker_bootstrap)
       mie_contract_ = std::make_unique<RocketMieContract>(layout->harts);
+    if (semantic_feedback_.enabled()) {
+      config.semantic_event_observer = [this](const rvwmo::RuntimeEvent &event) {
+        semantic_feedback_.observe(event);
+      };
+    }
     session_ = std::make_unique<rvwmo::HostSession>(memory_, std::move(config));
     if (!session_->configuration())
       throw std::invalid_argument("Rocket Runtime session: " + session_->configuration().message);
@@ -301,13 +308,18 @@ public:
           "HartBreaker ended without verified terminal retirement, stop acknowledgement and drained sources"});
     // Without the configured and observed terminal contract, finalization stays Incomplete.
     final_result_ = session_->finalize(cycle_);
+    const auto effective = failure_ ? final_result_ : failure_;
+    if (semantic_feedback_.enabled() &&
+        !semantic_feedback_.publish(*session_, effective, cycle_, static_cast<unsigned>(decoders_.size())))
+      std::fprintf(stderr, "DIFFTEST_S_ROCKET_SEMANTIC_UNAVAILABLE\n");
     std::fprintf(stderr, "DIFFTEST_S_FINAL %s\n", session_->final_report().c_str());
-    return failure_ ? final_result_ : failure_;
+    return effective;
   }
 
 private:
   GlobalMem memory_;
   std::unique_ptr<rvwmo::HostSession> session_;
+  RocketSemanticFeedback semantic_feedback_;
   std::vector<std::unique_ptr<RocketNativeDecoder>> decoders_;
   std::vector<std::set<unsigned>> initialized_dependencies_;
   struct MieFields {
