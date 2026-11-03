@@ -4,6 +4,7 @@
 #include "rvwmo/host_session.h"
 #include "rvwmo/producer_ids.h"
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -111,6 +112,21 @@ private:
     std::vector<rvwmo::MemoryOperation> members;
   };
 
+  // The native AMO path publishes an AtomicCommitCandidate, not a scalar
+  // LoadSample/StorePublish. Exclude only explicit atomic memory operations;
+  // every ordinary retired scalar operation must retain its final evidence.
+  static const char *excluded_class(const rvwmo::MemoryOperation &operation) {
+    if (operation.lr)
+      return "lr";
+    if (operation.sc)
+      return "sc";
+    return operation.atomic ? "amo" : nullptr;
+  }
+
+  static unsigned excluded_class_index(const rvwmo::MemoryOperation &operation) {
+    return operation.lr ? 1 : (operation.sc ? 2 : 0);
+  }
+
   static std::optional<uint64_t> mask_bits(const std::vector<uint8_t> &mask) {
     if (mask.empty() || mask.size() > 8)
       return std::nullopt;
@@ -165,6 +181,16 @@ private:
     }
     if (!epoch || !*epoch)
       return unavailable("missing_retirement_epoch");
+    std::vector<std::array<uint64_t, 3>> excluded_by_hart(harts);
+    uint64_t excluded_atomic_count = 0;
+    for (const auto &[id, operation] : retired) {
+      if (excluded_class(operation)) {
+        ++excluded_by_hart[id.hart][excluded_class_index(operation)];
+        ++excluded_atomic_count;
+      } else if (!operation.load && !operation.store) {
+        return unavailable("retired_scalar_operation_without_direction");
+      }
+    }
     std::set<OperationId> sampled_loads, published_stores;
     std::set<std::pair<uint32_t, uint64_t>> source_ids;
     std::set<std::pair<uint32_t, uint64_t>> transactions;
@@ -178,6 +204,8 @@ private:
         if (member == retired.end() || member->second.attempt != operation.attempt ||
             !operation.load || canceled.count({operation.id, operation.attempt}))
           continue; // Speculation and replay are not architectural interactions.
+        if (excluded_class(member->second) || excluded_class(operation))
+          return unavailable("excluded_atomic_load_sample_unexpected");
         if (member->second.address != operation.address || member->second.byte_mask != operation.byte_mask ||
             event.producer_id != hart_producer_id(operation.id.hart) ||
             !mask_bits(operation.byte_mask) || !sampled_loads.insert(operation.id).second ||
@@ -196,8 +224,11 @@ private:
           const auto found = retired.find(member.id);
           if (found == retired.end() || !found->second.store ||
               found->second.id.epoch != *epoch ||
-              event.producer_id != memory_fabric_producer_id(found->second.id.hart) ||
-              !published_stores.insert(member.id).second)
+              event.producer_id != memory_fabric_producer_id(found->second.id.hart))
+            return unavailable("published_member_not_retired");
+          if (excluded_class(found->second))
+            return unavailable("excluded_atomic_store_publish_unexpected");
+          if (!published_stores.insert(member.id).second)
             return unavailable("published_member_not_retired");
           effect.members.push_back(found->second);
         }
@@ -216,9 +247,22 @@ private:
       }
     }
     for (const auto &[id, operation] : retired) {
-      if ((operation.load && !sampled_loads.count(id)) ||
-          (operation.store && !published_stores.count(id)))
+      if (excluded_class(operation))
+        continue;
+      const bool missing_load = operation.load && !sampled_loads.count(id);
+      const bool missing_store = operation.store && !published_stores.count(id);
+      if (missing_load || missing_store) {
+        std::fprintf(stderr,
+            "DIFFTEST_S_ROCKET_SEMANTIC_MISSING hart=%u epoch=%llu uid=%llu subaccess=%u "
+            "attempt=%u atomic=%u lr=%u sc=%u address=0x%llx load=%u store=%u "
+            "missing_load_sample=%u missing_store_publish=%u\n",
+            id.hart, static_cast<unsigned long long>(id.epoch),
+            static_cast<unsigned long long>(id.uid), id.subaccess, operation.attempt,
+            operation.atomic, operation.lr, operation.sc,
+            static_cast<unsigned long long>(operation.address), operation.load, operation.store,
+            missing_load, missing_store);
         return unavailable("missing_final_load_or_publish");
+      }
     }
     if (effects.empty() || effects.size() > 100000)
       return unavailable("no_bounded_memory_effects");
@@ -235,7 +279,30 @@ private:
     }
     std::ostringstream output;
     output << "{\"schema_version\":1,\"kind\":\"rocket-source-closed.v1\","
-           << "\"source_clock\":\"" << clock_ << "\",\"epoch\":" << *epoch
+           << "\"scope\":\"ordinary_scalar_only\",\"excluded_atomic_count\":" << excluded_atomic_count
+           << ",\"excluded_atomic_by_hart\":[";
+    for (uint32_t hart = 0; hart < harts; ++hart) {
+      if (hart)
+        output << ',';
+      output << "{\"hart\":" << hart << ",\"amo\":" << excluded_by_hart[hart][0]
+             << ",\"lr\":" << excluded_by_hart[hart][1]
+             << ",\"sc\":" << excluded_by_hart[hart][2] << '}';
+    }
+    output << "],\"excluded_atomic_identities\":[";
+    bool first_excluded = true;
+    for (const auto &[id, operation] : retired) {
+      if (!excluded_class(operation))
+        continue;
+      if (!first_excluded)
+        output << ',';
+      first_excluded = false;
+      output << "{\"hart\":" << id.hart << ",\"epoch\":" << id.epoch << ",\"uid\":" << id.uid
+             << ",\"subaccess\":" << id.subaccess << ",\"attempt\":" << operation.attempt
+             << ",\"kind\":\"" << excluded_class(operation) << "\",\"physical_address\":" << operation.address
+             << ",\"load\":" << (operation.load ? "true" : "false")
+             << ",\"store\":" << (operation.store ? "true" : "false") << '}';
+    }
+    output << "],\"source_clock\":\"" << clock_ << "\",\"epoch\":" << *epoch
            << ",\"completed_cycle\":" << completed_cycle << ",\"first_cycle\":" << first
            << ",\"last_cycle\":" << last << ",\"cache_line_bytes\":64,\"intra_cycle_order_qualified\":false,"
            << "\"physical_address_verified\":true,\"complete\":true,\"producer_watermarks\":[";
