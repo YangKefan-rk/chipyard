@@ -214,7 +214,9 @@ private:
         effects.push_back({&event, operation, {}});
       } else if (event.kind == RuntimeEventKind::StorePublish) {
         const auto &publish = std::get<StorePublishEvent>(event.payload);
-        if (publish.members.empty() || !publish.transaction_id || !mask_bits(publish.byte_mask) ||
+        if (publish.members.empty() || !publish.transaction_id ||
+            publish.transaction_id != event.source.producer_sequence ||
+            !mask_bits(publish.byte_mask) ||
             !transactions.insert({event.producer_id, publish.transaction_id}).second ||
             !source_ids.insert({event.producer_id, event.source.producer_sequence}).second)
           return unavailable("publish_transaction_or_source_conflict");
@@ -279,7 +281,9 @@ private:
     }
     std::ostringstream output;
     output << "{\"schema_version\":1,\"kind\":\"rocket-source-closed.v1\","
-           << "\"scope\":\"ordinary_scalar_only\",\"excluded_atomic_count\":" << excluded_atomic_count
+           << "\"scope\":\"ordinary_scalar_only\","
+           << "\"publication_identity\":\"source_transaction_v1\","
+           << "\"excluded_atomic_count\":" << excluded_atomic_count
            << ",\"excluded_atomic_by_hart\":[";
     for (uint32_t hart = 0; hart < harts; ++hart) {
       if (hart)
@@ -337,8 +341,10 @@ private:
         output << ",\"retired\":true,\"uid\":" << op.id.uid
                << ",\"attempt\":" << op.attempt << ",\"subaccess\":" << op.id.subaccess;
       else {
+        // This counter identifies a real cache write within its producer and
+        // run. Rocket has no observed allocation generation for this group.
         output << ",\"transaction_id\":" << publish.transaction_id
-               << ",\"allocation_generation\":1,\"retired_members\":[";
+               << ",\"retired_members\":[";
         bool first_member = true;
         for (const auto &member : effect.members) {
           if (!first_member)
