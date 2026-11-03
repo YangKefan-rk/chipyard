@@ -214,6 +214,8 @@ private:
         effects.push_back({&event, operation, {}});
       } else if (event.kind == RuntimeEventKind::StorePublish) {
         const auto &publish = std::get<StorePublishEvent>(event.payload);
+        if (!publish.allocation_generation)
+          return unavailable("uncertified_store_group_generation");
         if (publish.members.empty() || !publish.transaction_id ||
             publish.transaction_id != event.source.producer_sequence ||
             !mask_bits(publish.byte_mask) ||
@@ -223,6 +225,8 @@ private:
         Effect effect;
         effect.event = &event;
         for (const auto &member : publish.members) {
+          if (!member.memory_generation)
+            return unavailable("uncertified_store_member_generation");
           const auto found = retired.find(member.id);
           if (found == retired.end() || !found->second.store ||
               found->second.id.epoch != *epoch ||
@@ -341,9 +345,9 @@ private:
         output << ",\"retired\":true,\"uid\":" << op.id.uid
                << ",\"attempt\":" << op.attempt << ",\"subaccess\":" << op.id.subaccess;
       else {
-        // This counter identifies a real cache write within its producer and
-        // run. Rocket has no observed allocation generation for this group.
+        // The source-qualified slot generation is distinct from the transaction ID.
         output << ",\"transaction_id\":" << publish.transaction_id
+               << ",\"allocation_generation\":" << publish.allocation_generation
                << ",\"retired_members\":[";
         bool first_member = true;
         for (const auto &member : effect.members) {
