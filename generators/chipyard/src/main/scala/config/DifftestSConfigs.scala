@@ -1,6 +1,6 @@
 package chipyard
 
-import freechips.rocketchip.rocket.{EnableDifftestRocketCache, RocketDCacheConfig}
+import freechips.rocketchip.rocket.{EnableDifftestRocketCache, EnableSfuzzRocketFunctional, RocketDCacheConfig}
 import freechips.rocketchip.subsystem.{InSubsystem, TilesLocated}
 import org.chipsalliance.cde.config.Config
 
@@ -56,6 +56,18 @@ class QuadRocketDifftestSConfig extends Config(
   new WithDifftestSRocketObservations ++
   new freechips.rocketchip.rocket.WithNBigCores(4) ++
   new chipyard.config.AbstractConfig
+)
+
+// Preserve QuadRocketDifftestSConfig's original native layout by default.
+// Enabling this variant appends passive L1 observations to the existing
+// four-hart Difftest-S native source; it does not modify cache behavior.
+class WithSfuzzRocketFunctionalProbe extends Config((site, here, up) => {
+  case EnableSfuzzRocketFunctional => true
+})
+
+class QuadRocketSFuzzDifftestSConfig extends Config(
+  new WithSfuzzRocketFunctionalProbe ++
+  new QuadRocketDifftestSConfig
 )
 
 class WithDifftestSRocketStoreMerging extends RocketDCacheConfig(_.copy(
