@@ -1,5 +1,6 @@
 #include "boom_native_source.h"
 #include "boom_hartbreaker_elf.h"
+#include "boom_semantic_export.h"
 #include "rvwmo/host_session.h"
 #include "rvwmo/dependency.h"
 #include "rvwmo/memory_image.h"
@@ -104,6 +105,8 @@ public:
     source_config.limits.ldq_slots = 8;
     source_config.limits.stq_slots = 8;
     source_ = std::make_unique<BoomNativeSource>(std::move(source_config));
+    if (const char *output = std::getenv("DIFFTEST_S_SEMANTIC_OUTPUT"); output && *output)
+      semantic_export_ = std::make_unique<BoomSemanticExport>(elf);
 
     rvwmo::HostSessionConfiguration config;
     config.platform = "boom";
@@ -163,6 +166,10 @@ public:
         first_tohost_store_ = store.id;
       return result;
     };
+    if (semantic_export_)
+      config.semantic_event_observer = [this](const rvwmo::RuntimeEvent &event) {
+        semantic_export_->observe(event);
+      };
     session_ = std::make_unique<rvwmo::HostSession>(memory_, std::move(config));
     if (!session_->configuration())
       throw std::invalid_argument("BOOM Runtime session: " + session_->configuration().message);
@@ -280,6 +287,18 @@ public:
             : "HartBreaker first success stop and four-hart physical drain are unproven"});
     }
     auto result = session_->finalize(cycle_);
+    if (semantic_export_) {
+      if (result && failure_ && session_->semantic_feedback_publishable()) {
+        try {
+          semantic_export_->publish(*session_);
+        } catch (const std::exception &error) {
+          // Feedback is optional; an export error never changes the checker verdict.
+          std::fprintf(stderr, "DIFFTEST_S_SEMANTIC_ERROR %s\n", error.what());
+        }
+      } else {
+        std::fprintf(stderr, "DIFFTEST_S_SEMANTIC_ERROR checker did not publish a complete semantic Pass\n");
+      }
+    }
     std::fprintf(stderr, "DIFFTEST_S_FINAL %s\n", session_->final_report().c_str());
     return failure_ ? result : failure_;
   }
@@ -288,6 +307,7 @@ private:
   GlobalMem memory_;
   std::unique_ptr<BoomNativeSource> source_;
   std::unique_ptr<rvwmo::HostSession> session_;
+  std::unique_ptr<BoomSemanticExport> semantic_export_;
   uint64_t cycle_ = 0;
   CheckResult failure_;
   uint64_t terminal_pc_ = 0;
