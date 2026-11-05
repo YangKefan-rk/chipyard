@@ -188,6 +188,42 @@ that its fixed layout's source clock, phases, physical addresses and horizon
 match the executed F probe build. A positive clock/address certification must
 not be inferred solely from a literal manifest field.
 
+### Bounded long-run semantic export (opt in)
+
+Set `DIFFTEST_S_SEMANTIC_CHUNK_CYCLES=256` to select the separate
+`difftest-s-semantic.v2` path. The caller must also pin
+`DIFFTEST_S_SEMANTIC_FIRST_CYCLE=0` from reset and
+`DIFFTEST_S_SEMANTIC_MAX_PAIR_GAP_CYCLES` to the independently reviewed
+layout (64 for the scalar profile, 128 for the WFI profile). Pin
+`DIFFTEST_S_SEMANTIC_LAYOUT_SHA256` to the **v2** layout manifest. The
+inclusive source horizon remains `DIFFTEST_S_SEMANTIC_LAST_CYCLE`; eight
+independent source watermarks must close that entire horizon. An observed
+memory event beyond it disables feedback instead of being silently discarded.
+
+The case-local `interaction-feedback.json` is the **last** file published,
+only after an independent checker Pass. It includes source clock/epoch,
+case/run/ELF/backend/layout identities, `first_cycle=0`, `last_cycle`,
+`chunk_cycles`, `max_pair_gap_cycles`, `line_bytes=64`,
+`qualified_phases=[0,1]`, complete/lossless producer watermarks, and `chunks`
+entries with inclusive `first_cycle`, `last_cycle`, zero-based `part`, safe
+relative `file`, `event_count`, and SHA-256 of the exact chunk file bytes.
+Each nonempty chunk file contains `{schema_version:2,first_cycle,last_cycle,events}`;
+empty source windows are implicit within the verified source horizon.
+Chunks split at 4,096 rows or approximately 1 MiB. Event rows retain the
+v1 final-attempt load and indivisible physical store-group identities,
+physical byte lanes, and original source cycle, phase, producer and sequence.
+Rows are serialized in deterministic source-time order; `ordering_scope` is
+`per_producer_only`: file order does **not** assert a cross-hart memory edge.
+
+The provisional join index uses a fresh per-case 0600 SQLite file in local
+scratch (`DIFFTEST_S_SEMANTIC_INDEX_DIR` can select an absolute directory;
+otherwise the system temporary directory is used). The index is deleted on
+normal exit and is never a checked semantic artifact. A crash leaves no
+complete manifest. Chunk publication uses exclusive creation and SHA-256;
+publication failure leaves feedback unavailable. This opt-in build requires
+`libsqlite3` and `libcrypto`; no chunk environment variable retains the
+original v1 wire format and observer behavior.
+
 Build the public source and host together against the matching Spike library:
 
 ```sh

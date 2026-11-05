@@ -1,4 +1,5 @@
 #include "boom_semantic_export.h"
+#include "boom_semantic_long_export.h"
 #include "rvwmo/host_session.h"
 #include "rvwmo/producer_ids.h"
 #include <algorithm>
@@ -165,9 +166,25 @@ BoomSemanticExport::BoomSemanticExport(const char *elf)
           std::filesystem::weakly_canonical(functional.parent_path()) ||
       output.filename() != "interaction-feedback.json")
     throw std::invalid_argument("BOOM semantic output must share its pinned functional case directory");
+  if (const char *value = std::getenv("DIFFTEST_S_SEMANTIC_CHUNK_CYCLES"); value && *value) {
+    const uint64_t chunk_cycles = number("DIFFTEST_S_SEMANTIC_CHUNK_CYCLES");
+    const uint64_t first_cycle = number("DIFFTEST_S_SEMANTIC_FIRST_CYCLE");
+    const uint64_t max_pair_gap_cycles = number("DIFFTEST_S_SEMANTIC_MAX_PAIR_GAP_CYCLES");
+    if (!chunk_cycles || chunk_cycles > 1048576)
+      throw std::invalid_argument("BOOM semantic chunk cycles must be within 1..1048576");
+    long_export_ = std::make_unique<BoomSemanticLongExport>(output_, case_id_, run_id_,
+        elf_sha256_, backend_sha256_, layout_sha256_, first_cycle, last_cycle_, chunk_cycles, max_pair_gap_cycles);
+  }
 }
 
+BoomSemanticExport::~BoomSemanticExport() = default;
+
 void BoomSemanticExport::observe(const rvwmo::RuntimeEvent &event) {
+  if (long_export_) {
+    if (published_) throw std::runtime_error("BOOM semantic export was already published");
+    long_export_->observe(event);
+    return;
+  }
   if (published_ || observed_.size() >= kMaxObserved)
     throw std::runtime_error("BOOM semantic observer exhausted its bounded case-local storage");
   observed_.push_back(event);  // Never retain the ephemeral checker callback reference.
@@ -185,6 +202,11 @@ void BoomSemanticExport::publish(const rvwmo::HostSession &session) {
     const auto watermark = watermarks.find(producer.id);
     if (watermark == watermarks.end() || watermark->second.cycle < last_cycle_)
       throw std::runtime_error("BOOM semantic source watermark does not close the scoring horizon");
+  }
+  if (long_export_) {
+    long_export_->publish(watermarks);
+    published_ = true;
+    return;
   }
   std::map<OperationId, rvwmo::RetiredInstruction> retired;
   std::map<OperationId, RetiredMemory> memory;
