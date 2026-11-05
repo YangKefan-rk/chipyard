@@ -164,7 +164,7 @@ std::string chunk_name(uint64_t window, uint64_t part) {
 
 struct BoomSemanticLongExport::Impl {
   std::string output, case_id, run_id, elf, backend, layout, database_path;
-  uint64_t first_cycle, last_cycle, chunk_cycles, max_pair_gap_cycles;
+  uint64_t first_cycle, max_cycle_budget, chunk_cycles, max_pair_gap_cycles;
   sqlite3 *db = nullptr;
   bool published = false;
   std::vector<std::string> published_chunks;
@@ -174,7 +174,7 @@ struct BoomSemanticLongExport::Impl {
       uint64_t first, uint64_t horizon, uint64_t width, uint64_t gap)
       : output(std::move(output_path)), case_id(std::move(case_name)), run_id(std::move(run_name)),
         elf(std::move(elf_hash)), backend(std::move(backend_hash)), layout(std::move(layout_hash)),
-        first_cycle(first), last_cycle(horizon), chunk_cycles(width), max_pair_gap_cycles(gap) {
+        first_cycle(first), max_cycle_budget(horizon), chunk_cycles(width), max_pair_gap_cycles(gap) {
     if (first != 0 || !width || width > 1048576 || !gap || gap > 1048576 || first > horizon ||
         horizon >= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
       throw std::invalid_argument("BOOM semantic layout range, chunk width or pair gap is invalid");
@@ -278,7 +278,7 @@ struct BoomSemanticLongExport::Impl {
     }
     if (event.kind != RuntimeEventKind::LoadSample && event.kind != RuntimeEventKind::StorePublish)
       return;
-    if (event.source.cycle < first_cycle || event.source.cycle > last_cycle)
+    if (event.source.cycle < first_cycle || event.source.cycle > max_cycle_budget)
       throw std::runtime_error("BOOM semantic memory event falls outside the pinned scoring horizon");
     if (!event.source.producer_sequence || !event.source.order_qualified ||
         event.source.qualified_phase > 1)
@@ -322,13 +322,15 @@ struct BoomSemanticLongExport::Impl {
     }
   }
 
-  void publish(const std::map<uint32_t, rvwmo::SourcePosition> &watermarks) {
+  void publish(const std::map<uint32_t, rvwmo::SourcePosition> &watermarks, uint64_t completed_cycle) {
+    if (!completed_cycle || completed_cycle > max_cycle_budget)
+      throw std::runtime_error("BOOM semantic checked completion exceeds the pinned cycle budget");
     if (published || watermarks.size() != 8)
       throw std::runtime_error("BOOM semantic source roster is incomplete or already published");
     for (uint32_t hart = 0; hart < 4; ++hart) {
       for (const uint32_t id : {rvwmo::hart_producer_id(hart), rvwmo::memory_fabric_producer_id(hart)}) {
         const auto found = watermarks.find(id);
-        if (found == watermarks.end() || found->second.cycle < last_cycle)
+        if (found == watermarks.end() || found->second.cycle < completed_cycle)
           throw std::runtime_error("BOOM semantic source watermark does not close the scoring horizon");
       }
     }
@@ -371,7 +373,7 @@ struct BoomSemanticLongExport::Impl {
     auto flush = [&] {
       if (!row_count) return;
       const uint64_t chunk_first = first_cycle + window * chunk_cycles;
-      const uint64_t final_cycle = std::min(last_cycle, chunk_first + chunk_cycles - 1);
+      const uint64_t final_cycle = std::min(completed_cycle, chunk_first + chunk_cycles - 1);
       const auto filename = chunk_name(window, part++);
       std::ostringstream content;
       content << "{\"schema_version\":2,\"first_cycle\":" << chunk_first
@@ -392,6 +394,8 @@ struct BoomSemanticLongExport::Impl {
       const uint64_t sample_id = samples.number(0), sample_window = samples.number(1);
       const uint64_t producer = samples.number(2), sequence = samples.number(3);
       const uint64_t cycle = samples.number(4), phase = samples.number(5), kind = samples.number(6);
+      if (cycle > completed_cycle)
+        throw std::runtime_error("BOOM semantic accepted memory event is later than checked completion");
       const uint64_t hart = samples.number(7), epoch = samples.number(8), uid = samples.number(9);
       const uint64_t subaccess = samples.number(10), attempt = samples.number(11);
       const uint64_t address = samples.number(12), mask = samples.number(13), lanes = samples.number(14);
@@ -484,7 +488,8 @@ struct BoomSemanticLongExport::Impl {
              << ",\"backend_sha256\":" << json_string(backend) << ",\"layout_sha256\":" << json_string(layout)
              << ",\"source_clock\":" << json_string(kClock)
              << ",\"epoch\":1,\"complete\":true,\"ordering_scope\":\"per_producer_only\""
-             << ",\"first_cycle\":" << first_cycle << ",\"last_cycle\":" << last_cycle
+             << ",\"first_cycle\":" << first_cycle << ",\"last_cycle\":" << completed_cycle
+             << ",\"max_cycle_budget\":" << max_cycle_budget
              << ",\"chunk_cycles\":" << chunk_cycles << ",\"max_pair_gap_cycles\":" << max_pair_gap_cycles
              << ",\"line_bytes\":64,\"qualified_phases\":[0,1]"
              << ",\"required_producers\":[";
@@ -509,19 +514,20 @@ struct BoomSemanticLongExport::Impl {
     write_exclusive(output, manifest.str());
     published = true;
     std::fprintf(stderr, "DIFFTEST_S_SEMANTIC_EXPORT {\"loads\":%zu,\"stores\":%zu,\"last_cycle\":%llu,\"chunks\":%zu}\n",
-        loads, stores, static_cast<unsigned long long>(last_cycle), chunk_count);
+        loads, stores, static_cast<unsigned long long>(completed_cycle), chunk_count);
   }
 };
 
 BoomSemanticLongExport::BoomSemanticLongExport(std::string output, std::string case_id, std::string run_id,
     std::string elf_sha256, std::string backend_sha256, std::string layout_sha256,
-    uint64_t first_cycle, uint64_t last_cycle, uint64_t chunk_cycles, uint64_t max_pair_gap_cycles)
+    uint64_t first_cycle, uint64_t max_cycle_budget, uint64_t chunk_cycles, uint64_t max_pair_gap_cycles)
     : impl_(std::make_unique<Impl>(std::move(output), std::move(case_id), std::move(run_id),
-          std::move(elf_sha256), std::move(backend_sha256), std::move(layout_sha256), first_cycle, last_cycle, chunk_cycles, max_pair_gap_cycles)) {}
+          std::move(elf_sha256), std::move(backend_sha256), std::move(layout_sha256), first_cycle, max_cycle_budget, chunk_cycles, max_pair_gap_cycles)) {}
 BoomSemanticLongExport::~BoomSemanticLongExport() = default;
 void BoomSemanticLongExport::observe(const rvwmo::RuntimeEvent &event) { impl_->observe(event); }
-void BoomSemanticLongExport::publish(const std::map<uint32_t, rvwmo::SourcePosition> &watermarks) {
-  impl_->publish(watermarks);
+void BoomSemanticLongExport::publish(const std::map<uint32_t, rvwmo::SourcePosition> &watermarks,
+    uint64_t checked_completed_cycle) {
+  impl_->publish(watermarks, checked_completed_cycle);
 }
 
 } // namespace difftest_s::native

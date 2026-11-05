@@ -15,13 +15,14 @@ class BoomSemanticLongExport {
 public:
   BoomSemanticLongExport(std::string output, std::string case_id, std::string run_id,
       std::string elf_sha256, std::string backend_sha256, std::string layout_sha256,
-      uint64_t first_cycle, uint64_t last_cycle, uint64_t chunk_cycles, uint64_t max_pair_gap_cycles);
+      uint64_t first_cycle, uint64_t max_cycle_budget, uint64_t chunk_cycles, uint64_t max_pair_gap_cycles);
   ~BoomSemanticLongExport();
   BoomSemanticLongExport(const BoomSemanticLongExport &) = delete;
   BoomSemanticLongExport &operator=(const BoomSemanticLongExport &) = delete;
 
   void observe(const rvwmo::RuntimeEvent &event);
-  void publish(const std::map<uint32_t, rvwmo::SourcePosition> &verified_watermarks);
+  void publish(const std::map<uint32_t, rvwmo::SourcePosition> &verified_watermarks,
+      uint64_t checked_completed_cycle);
 
 private:
   struct Impl;

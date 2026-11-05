@@ -191,19 +191,26 @@ not be inferred solely from a literal manifest field.
 ### Bounded long-run semantic export (opt in)
 
 Set `DIFFTEST_S_SEMANTIC_CHUNK_CYCLES=256` to select the separate
-`difftest-s-semantic.v2` path. The caller must also pin
-`DIFFTEST_S_SEMANTIC_FIRST_CYCLE=0` from reset and
-`DIFFTEST_S_SEMANTIC_MAX_PAIR_GAP_CYCLES` to the independently reviewed
-layout (64 for the scalar profile, 128 for the WFI profile). Pin
-`DIFFTEST_S_SEMANTIC_LAYOUT_SHA256` to the **v2** layout manifest. The
-inclusive source horizon remains `DIFFTEST_S_SEMANTIC_LAST_CYCLE`; eight
-independent source watermarks must close that entire horizon. An observed
-memory event beyond it disables feedback instead of being silently discarded.
+`difftest-s-semantic.v2` path. Before the run, the caller must pin
+`DIFFTEST_S_SEMANTIC_FIRST_CYCLE=0` from reset,
+`DIFFTEST_S_SEMANTIC_MAX_CYCLE_BUDGET` to the largest permitted completion
+cycle, and `DIFFTEST_S_SEMANTIC_MAX_PAIR_GAP_CYCLES` to the independently
+reviewed layout (64 for the scalar profile, 128 for the WFI profile). Pin
+`DIFFTEST_S_SEMANTIC_LAYOUT_SHA256` to the **v2** layout manifest. v2 rejects
+the old `DIFFTEST_S_SEMANTIC_LAST_CYCLE` variable; that fixed horizon remains
+v1-only. Only after an independently checked terminal Pass does the exporter
+select its inclusive actual `last_cycle` from `HostSession::semantic_completed_cycle()`.
+It fails if completion exceeds the predeclared budget, any accepted memory
+event falls outside the actual completed horizon, or any of the eight producer
+watermarks fails to close that actual horizon. The manifest attests **both**
+`max_cycle_budget` and the checked actual `last_cycle`: consumers must verify
+the budget against the predeclared layout and must not choose a shorter horizon
+after seeing the interaction score.
 
 The case-local `interaction-feedback.json` is the **last** file published,
 only after an independent checker Pass. It includes source clock/epoch,
-case/run/ELF/backend/layout identities, `first_cycle=0`, `last_cycle`,
-`chunk_cycles`, `max_pair_gap_cycles`, `line_bytes=64`,
+case/run/ELF/backend/layout identities, `first_cycle=0`, checked `last_cycle`,
+predeclared `max_cycle_budget`, `chunk_cycles`, `max_pair_gap_cycles`, `line_bytes=64`,
 `qualified_phases=[0,1]`, complete/lossless producer watermarks, and `chunks`
 entries with inclusive `first_cycle`, `last_cycle`, zero-based `part`, safe
 relative `file`, `event_count`, and SHA-256 of the exact chunk file bytes.
