@@ -68,3 +68,20 @@ class QuadSmallBoomV4DifftestSConfig extends Config(
   new boom.v4.common.WithNSmallBooms(4) ++
   new chipyard.config.AbstractConfig
 )
+
+class WithDifftestSBoomMSHRs(entries: Int) extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site).map {
+    case tile: boom.v4.common.BoomTileAttachParams =>
+      tile.copy(tileParams = tile.tileParams.copy(
+        dcache = tile.tileParams.dcache.map(_.copy(nMSHRs = entries))
+      ))
+    case other => other
+  }
+}) {
+  require(entries > 0, "BOOM Difftest-S MSHR count must be positive")
+}
+
+class QuadSmallBoomV4Mshr8DifftestSConfig extends Config(
+  new WithDifftestSBoomMSHRs(8) ++
+  new QuadSmallBoomV4DifftestSConfig
+)
