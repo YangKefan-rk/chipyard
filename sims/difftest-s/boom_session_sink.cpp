@@ -115,8 +115,12 @@ public:
         ? "initialized DRAM-entry scalar RAM; own-hart CLINT device stores skipped without value or I/O-order verification; boot ROM uncovered"
         : "initialized DRAM-entry scalar RAM; boot ROM, bootstrap CSR/MMIO/traps are uncovered";
     config.verification_scope += "; mcycle pure-read values are source-sampled environment inputs, counter generation is not independently checked";
+    // The physical exception certificate covers trap routing and scalar CSR
+    // poststate, not a complete architectural register-file readback.
+    config.verification_scope += "; synchronous trap UID/PC/cause/redirect/privilege/active-bank CSR/tval checked; inactive-bank CSR prestate and full DUT GPR/FPR trap poststate unobserved";
     config.skip_device_stores = tohost_address_ != 0;
     config.reference_profile = DIFFTEST_REF_PROFILE_ID_BOOM;
+    config.check_boom_traps = true;
     config.initial_harts.resize(layout->harts);
     initialized_registers_.resize(layout->harts);
     initialized_fpr_.resize(layout->harts);
@@ -125,6 +129,7 @@ public:
     success_stores_.resize(layout->harts);
     const std::vector<rvwmo::RuntimeEventKind> hart_kinds = {
       rvwmo::RuntimeEventKind::InstructionAllocate, rvwmo::RuntimeEventKind::InstructionRetire,
+      rvwmo::RuntimeEventKind::Trap,
       rvwmo::RuntimeEventKind::InstructionCancelAttempt, rvwmo::RuntimeEventKind::InstructionSquash,
       rvwmo::RuntimeEventKind::LocalStore, rvwmo::RuntimeEventKind::LoadSample,
       rvwmo::RuntimeEventKind::AtomicLifecycle};
@@ -196,9 +201,11 @@ public:
       // stall, not an earlier retirement still awaiting its load evidence.
       if (result && tohost_address_)
         for (const auto &event : ready.batch.events) {
-          if (event.kind != rvwmo::RuntimeEventKind::InstructionRetire)
+          if (event.kind != rvwmo::RuntimeEventKind::InstructionRetire &&
+              event.kind != rvwmo::RuntimeEventKind::Trap)
             continue;
-          const auto hart = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction.hart;
+          const auto hart = event.kind == rvwmo::RuntimeEventKind::Trap
+              ? std::get<rvwmo::TrapEvent>(event.payload).hart : std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction.hart;
           if (hart >= parked_harts_.size()) {
             result = {CheckStatus::Invalid, 0, "HartBreaker retirement names an unknown hart"};
             break;
@@ -209,7 +216,7 @@ public:
           }
         }
       if (result) {
-        const auto submitted = session_->submit(ready.batch, ready.retirements);
+        const auto submitted = session_->submit(ready.batch, ready.retirements, ready.traps);
         result = submitted.check;
         // Acceptance owns these snapshots even when an earlier semantic fact
         // keeps REF pending. Completion below still requires a successful poll.

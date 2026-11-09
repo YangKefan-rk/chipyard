@@ -34,6 +34,10 @@ void select_entry_scope(boom::NativeFrame &frame, uint64_t entry_uid) {
   exclude_bootstrap(frame.store_releases, entry_uid, identity);
   exclude_bootstrap(frame.squashes, entry_uid, identity);
   exclude_bootstrap(frame.atomic_applied, entry_uid, identity);
+  if (frame.trap && frame.trap->identity.uid < entry_uid)
+    frame.trap.reset();
+  if (frame.trap_post && frame.trap_post->identity.uid < entry_uid)
+    frame.trap_post.reset();
   const auto probe_identity = [](const auto &record) { return record.probe.identity; };
   exclude_bootstrap(frame.completions, entry_uid, probe_identity);
   exclude_bootstrap(frame.publications, entry_uid, probe_identity);
@@ -106,7 +110,7 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
     outside.instructions += frame.retirements.size();
     outside.loads += frame.completions.size();
     outside.stores += frame.publications.size();
-    outside.traps += frame.trap;
+    outside.traps += frame.trap.has_value();
     // Bootstrap RAM writes require an explicit initialized-state contract. This
     // source deliberately does not derive reference RAM from observed DUT data.
     if (!frame.publications.empty())
@@ -247,6 +251,9 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
   for (const auto &snapshot : ready.retirements)
     if (!snapshots_.emplace(snapshot.id, snapshot).second)
       return invalid("BOOM source repeats an architectural retirement snapshot");
+  for (const auto &trap : ready.traps)
+    if (!traps_.emplace(trap.id, trap).second)
+      return invalid("BOOM source repeats a physical trap post-state snapshot");
   return {};
 }
 
@@ -281,6 +288,14 @@ CheckResult BoomNativeSource::take_ready(boom::CollectedObservations &output) {
         for (auto &member : std::get<rvwmo::StorePublishEvent>(converted.payload).members)
           member.publish_position = converted.source;
     }
+    if (event.kind == rvwmo::RuntimeEventKind::Trap) {
+      const auto &trap = std::get<rvwmo::TrapEvent>(event.payload);
+      const auto snapshot = traps_.find(trap.instruction);
+      if (snapshot == traps_.end())
+        return remember_failure(invalid("BOOM precise trap has no matched physical post-state"));
+      ready.traps.push_back(snapshot->second);
+      retired.push_back(trap.instruction);
+    }
     if (event.kind == rvwmo::RuntimeEventKind::InstructionRetire) {
       const auto &instruction = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction;
       const rvwmo::OperationId id{instruction.hart, instruction.epoch, instruction.uid, 0};
@@ -299,6 +314,8 @@ CheckResult BoomNativeSource::take_ready(boom::CollectedObservations &output) {
   events_.erase(std::remove_if(events_.begin(), events_.end(), [through](const auto &event) {
     return event.source.cycle <= through;
   }), events_.end());
+  for (const auto &trap : ready.traps)
+    traps_.erase(trap.id);
   for (const auto &id : retired)
     snapshots_.erase(id);
   emitted_publication_sequence_ = next_fabric_sequence;
@@ -322,7 +339,7 @@ CheckResult BoomNativeSource::certify_wfi_terminals() {
   if (configuration_.terminal_wfi_pcs.empty())
     return {CheckStatus::Unsupported, 0, "BOOM source has no independently verified WFI terminal profile"};
   if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
-      !events_.empty() || !snapshots_.empty())
+      !events_.empty() || !snapshots_.empty() || !traps_.empty())
     return incomplete("BOOM source has not delivered its final WFI-cycle event prefix");
   for (uint32_t hart = 0; hart < collectors_.size(); ++hart) {
     const auto &park = wfi_park_facts_[hart];
@@ -343,7 +360,7 @@ CheckResult BoomNativeSource::completion() const {
   if (!failure_)
     return failure_;
   if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
-      !events_.empty() || !snapshots_.empty())
+      !events_.empty() || !snapshots_.empty() || !traps_.empty())
     return incomplete("BOOM native source still has undelivered events or snapshots");
   if (configuration_.terminal_pc)
     for (uint32_t hart = 0; hart < collectors_.size(); ++hart) {
