@@ -305,6 +305,7 @@ struct BoomNativeDecoder::Fields {
   std::optional<WfiParkFields> wfi;
   std::optional<CsrPostFields> csr_post;
   std::optional<CsrPostFields> csr_write_post;
+  std::optional<CsrPostFields> counter_read;
   std::vector<FpPostFields> fp_post;
   std::vector<DeviceStoreFields> mmio_requests, mmio_acks;
 
@@ -341,6 +342,8 @@ struct BoomNativeDecoder::Fields {
       csr_post.emplace(metadata, "core.csr_post");
     if (metadata.has_field("core.csr_write_post.valid"))
       csr_write_post.emplace(metadata, "core.csr_write_post");
+    if (metadata.has_field("core.counter_read.valid"))
+      counter_read.emplace(metadata, "core.counter_read");
     if (metadata.has_field("core.fp_post[0].valid"))
       fp_post = vector_fields<FpPostFields>(metadata, "core.fp_post");
     const bool requests = metadata.has_field("cache.mmio_request[0].valid");
@@ -376,6 +379,14 @@ struct BoomNativeDecoder::Fields {
           observation.source_cycle + 1 != frame.cycle)
         throw std::invalid_argument("BOOM CSR observation is not one cycle after its retired owner");
       frame.csr_post = observation;
+    }
+    frame.counter_read_probe_available = counter_read.has_value();
+    if (counter_read && counter_read->valid.read(sample)) {
+      auto observation = counter_read->read(sample);
+      if (!observation.source_cycle || observation.source_cycle == UINT64_MAX ||
+          observation.source_cycle + 1 != frame.cycle)
+        throw std::invalid_argument("BOOM counter read is not one cycle after its execution sample");
+      frame.counter_read = observation;
     }
     frame.csr_write_probe_available = csr_write_post.has_value();
     frame.fp_probe_available = !fp_post.empty();

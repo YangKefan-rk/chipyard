@@ -97,6 +97,7 @@ public:
     source_config.checked_ram_size = ram_size;
     source_config.skip_device_stores = tohost_address_ != 0;
     source_config.check_csr_post = tohost_address_ != 0 || terminal_pc_ != 0;
+    source_config.check_counter_reads = source_config.check_csr_post;
     source_config.check_fp_post = tohost_address_ != 0 || terminal_pc_ != 0;
     source_config.entry_pcs.assign(layout->harts, entry);
     // Exact native Small BOOM V4 profile: ROB32/LDQ8/STQ8. Other configurations
@@ -113,6 +114,7 @@ public:
     config.verification_scope = tohost_address_
         ? "initialized DRAM-entry scalar RAM; own-hart CLINT device stores skipped without value or I/O-order verification; boot ROM uncovered"
         : "initialized DRAM-entry scalar RAM; boot ROM, bootstrap CSR/MMIO/traps are uncovered";
+    config.verification_scope += "; mcycle pure-read values are source-sampled environment inputs, counter generation is not independently checked";
     config.skip_device_stores = tohost_address_ != 0;
     config.reference_profile = DIFFTEST_REF_PROFILE_ID_BOOM;
     config.initial_harts.resize(layout->harts);
@@ -477,7 +479,7 @@ private:
         // only GPRs need an independent entry value before that comparison.
         if (reg >= 32 && reg < 64 && retirement.fp_post && initialized_fp[reg - 32])
           continue;
-        if (reg >= 64 && certified_csr)
+        if (reg >= 64 && (certified_csr || retirement.counter_read))
           continue;
         return {CheckStatus::Unsupported, 0, "entry program reads an uninitialized GPR, FPR or uncertified CSR"};
       }

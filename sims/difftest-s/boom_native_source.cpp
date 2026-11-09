@@ -127,6 +127,7 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
       config.checked_ram_size = configuration_.checked_ram_size;
       config.skip_device_stores = configuration_.skip_device_stores;
       config.check_csr_post = configuration_.check_csr_post;
+      config.check_counter_reads = configuration_.check_counter_reads;
       config.check_fp_post = configuration_.check_fp_post;
       config.terminal_wfi_pcs = configuration_.terminal_wfi_pcs;
       collectors_[hart] = std::make_unique<boom::NativeCollector>(config);
@@ -183,6 +184,8 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
     frame.csr_post.reset();
   if (frame.csr_write_post && frame.csr_write_post->identity.uid < entry_uids_[hart])
     frame.csr_write_post.reset();
+  if (frame.counter_read && frame.counter_read->identity.uid < entry_uids_[hart])
+    frame.counter_read.reset();
   frame.fp_posts.erase(std::remove_if(frame.fp_posts.begin(), frame.fp_posts.end(),
       [&](const auto &post) { return post.identity.uid < entry_uids_[hart]; }), frame.fp_posts.end());
   if (configuration_.terminal_pc) {
