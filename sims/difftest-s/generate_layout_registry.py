@@ -22,6 +22,14 @@ def validate_layout(layout):
     certificate = layout.get('sram_capture_boundary', False)
     if type(certificate) is not bool or (certificate and kind != 2):
         raise ValueError('invalid BOOM SRAM capture-boundary certificate')
+    if kind == 2:
+        capacities = layout.get('queue_capacity')
+        if not isinstance(capacities, dict) or set(capacities) != {'rob', 'ldq', 'stq'}:
+            raise ValueError('BOOM native layout lacks generated queue capacities')
+        for name in ('rob', 'ldq', 'stq'):
+            bounded_integer(capacities, name, 1, 65536)
+    elif 'queue_capacity' in layout:
+        raise ValueError('non-BOOM native layout carries BOOM queue capacities')
     if not isinstance(layout['fields'], list) or not layout['fields']:
         raise ValueError('native layout has no fields')
     offset = 0
@@ -66,10 +74,12 @@ def generate(layouts):
         for field in layout['fields']:
             path = json.dumps(field['path'])
             lines.append(f'  {{{path}, {field["offset"]}, {field["width"]}}},')
+        capacities = layout.get('queue_capacity', {'rob': 0, 'ldq': 0, 'stq': 0})
+        capacity_entry = '{' + ', '.join(str(capacities[key]) for key in ('rob', 'ldq', 'stq')) + '}'
         lines += ['};', f'static constexpr NativeProbeLayout layout_{label} = {{',
                   f'  1, {layout["kind"]}, {layout["hart"]}, {layout["harts"]}, {layout["bits"]},',
                   f'  sizeof(fields_{label}) / sizeof(fields_{label}[0]), fields_{label},',
-                  '  ' + str(layout.get('sram_capture_boundary', False)).lower(), '};']
+                  '  ' + str(layout.get('sram_capture_boundary', False)).lower() + ', ' + capacity_entry, '};']
     lines += ['} // namespace', '',
               'const NativeProbeLayout *find_native_layout(uint32_t kind, uint32_t hart) {']
     for kind, hart in sorted(keys):

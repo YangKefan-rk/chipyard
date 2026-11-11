@@ -20,7 +20,7 @@ private object NativePayload {
   }
 
   def pack(kind: Int, hart: Int, rosterSize: Int, sramCaptureBoundary: Boolean,
-           records: (String, Data)*): UInt = {
+           queueCapacities: Option[DifftestSQueueCapacities], records: (String, Data)*): UInt = {
     var offset = 0
     val fields = records.flatMap { case (path, signal) => leaves(path, signal) }.map { case (path, signal) =>
       require(signal.getWidth > 0 && signal.getWidth <= 64, s"Difftest-S native field $path has unsupported width")
@@ -29,6 +29,9 @@ private object NativePayload {
       field
     }
     require(fields.nonEmpty)
+    require((kind == 2) == queueCapacities.nonEmpty, "Only BOOM layouts carry queue capacities")
+    val capacityHeader = queueCapacities.map(c => s"{${c.rob}, ${c.ldq}, ${c.stq}}").getOrElse("{0, 0, 0}")
+    val capacityJson = queueCapacities.map(c => s",\"queue_capacity\":{\"rob\":${c.rob},\"ldq\":${c.ldq},\"stq\":${c.stq}}").getOrElse("")
     val label = s"${kind}_$hart"
     val entries = fields.map(f => s"  {\"${f.path}\", ${f.offset}, ${f.width}}").mkString(",\n")
     val header = s"""#pragma once
@@ -39,14 +42,14 @@ private object NativePayload {
         |};
         |inline constexpr NativeProbeLayout layout_$label = {
         |  1, $kind, $hart, $rosterSize, $offset,
-        |  sizeof(fields_$label) / sizeof(fields_$label[0]), fields_$label, $sramCaptureBoundary
+        |  sizeof(fields_$label) / sizeof(fields_$label[0]), fields_$label, $sramCaptureBoundary, $capacityHeader
         |};
         |}
         |""".stripMargin
     val jsonFields = fields.map(f => s"{\"path\":\"${f.path}\",\"offset\":${f.offset},\"width\":${f.width}}").mkString(",")
     ElaborationArtefacts.add(s"difftest-s-layout-$label.h", header)
     ElaborationArtefacts.add(s"difftest-s-layout-$label.json",
-      s"{\"abi\":1,\"kind\":$kind,\"hart\":$hart,\"harts\":$rosterSize,\"bits\":$offset,\"sram_capture_boundary\":$sramCaptureBoundary,\"fields\":[$jsonFields]}")
+      s"{\"abi\":1,\"kind\":$kind,\"hart\":$hart,\"harts\":$rosterSize,\"bits\":$offset,\"sram_capture_boundary\":$sramCaptureBoundary$capacityJson,\"fields\":[$jsonFields]}")
     Cat(fields.reverse.map(_.signal))
   }
 }
@@ -92,7 +95,7 @@ class WithDifftestSNativeSimulation extends HarnessBinder({
     require(chipId == 0, "Difftest-S native transport currently supports one chip")
     val rosterSize = harness.chipParameters(chipId)(freechips.rocketchip.subsystem.NumTiles)
     val observation = port.io
-    val payload = NativePayload.pack(2, port.tileId, rosterSize, port.sramCaptureBoundary,
+    val payload = NativePayload.pack(2, port.tileId, rosterSize, port.sramCaptureBoundary, Some(port.queueCapacities),
       "core" -> observation.core, "lsu" -> observation.lsu, "cache" -> observation.cache)
     val probe = Module(new DifftestSNativeProbe(2, port.tileId, rosterSize, payload.getWidth))
     probe.io.clock := observation.source.clock
@@ -105,7 +108,7 @@ class WithDifftestSNativeSimulation extends HarnessBinder({
     require(chipId == 0, "Difftest-S native transport currently supports one chip")
     val rosterSize = harness.chipParameters(chipId)(freechips.rocketchip.subsystem.NumTiles)
     val observation = port.io
-    val payload = NativePayload.pack(1, port.tileId, rosterSize, false,
+    val payload = NativePayload.pack(1, port.tileId, rosterSize, false, None,
       "core" -> observation.core, "cache" -> observation.cache,
       "coreRequestor" -> observation.coreRequestor, "cacheRequestors" -> observation.cacheRequestors,
       "terminal" -> observation.terminal)

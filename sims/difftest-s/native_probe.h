@@ -15,6 +15,12 @@ struct NativeFieldSpec {
   uint32_t width;
 };
 
+struct NativeQueueCapacities {
+  uint32_t rob = 0;
+  uint32_t ldq = 0;
+  uint32_t stq = 0;
+};
+
 struct NativeProbeLayout {
   uint32_t abi_version;
   uint32_t kind;
@@ -26,6 +32,7 @@ struct NativeProbeLayout {
   // Generator certificate for the selected BOOM duplicated-array macro. Legacy
   // layouts default false; it never changes a DUT-supplied sampling cycle.
   bool sram_capture_boundary = false;
+  NativeQueueCapacities queue_capacity;
 };
 
 struct NativeHartSample {

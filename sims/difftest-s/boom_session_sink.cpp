@@ -100,11 +100,20 @@ public:
     source_config.check_counter_reads = source_config.check_csr_post;
     source_config.check_fp_post = tohost_address_ != 0 || terminal_pc_ != 0;
     source_config.entry_pcs.assign(layout->harts, entry);
-    // Exact native Small BOOM V4 profile: ROB32/LDQ8/STQ8. Other configurations
-    // require their real capacity metadata rather than the adapter maximums.
-    source_config.limits.rob_slots = 32;
-    source_config.limits.ldq_slots = 8;
-    source_config.limits.stq_slots = 8;
+    // The elaborator records the selected core's capacities independently of
+    // dynamic queue indices. Never infer capacity from the largest seen slot.
+    const auto capacity = layout->queue_capacity;
+    if (!capacity.rob || !capacity.ldq || !capacity.stq)
+      throw std::invalid_argument("BOOM Runtime sink requires generated queue capacities");
+    for (uint32_t hart = 0; hart < layout->harts; ++hart) {
+      const auto *peer = find_native_layout(2, hart);
+      if (!peer || peer->queue_capacity.rob != capacity.rob ||
+          peer->queue_capacity.ldq != capacity.ldq || peer->queue_capacity.stq != capacity.stq)
+        throw std::invalid_argument("BOOM native hart queue capacity metadata differs");
+    }
+    source_config.limits.rob_slots = capacity.rob;
+    source_config.limits.ldq_slots = capacity.ldq;
+    source_config.limits.stq_slots = capacity.stq;
     source_ = std::make_unique<BoomNativeSource>(std::move(source_config));
     if (const char *output = std::getenv("DIFFTEST_S_SEMANTIC_OUTPUT"); output && *output)
       semantic_export_ = std::make_unique<BoomSemanticExport>(elf);
