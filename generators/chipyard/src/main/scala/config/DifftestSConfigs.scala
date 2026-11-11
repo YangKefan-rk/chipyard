@@ -85,3 +85,20 @@ class QuadSmallBoomV4Mshr8DifftestSConfig extends Config(
   new WithDifftestSBoomMSHRs(8) ++
   new QuadSmallBoomV4DifftestSConfig
 )
+
+class WithDifftestSBoomLoadQueue(entries: Int) extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site).map {
+    case tile: boom.v4.common.BoomTileAttachParams =>
+      tile.copy(tileParams = tile.tileParams.copy(
+        core = tile.tileParams.core.copy(numLdqEntries = entries)
+      ))
+    case other => other
+  }
+}) {
+  require(entries > 2, "BOOM load queue must have space beyond the single-wide dispatch")
+}
+
+class QuadSmallBoomV4Ldq16Mshr8DifftestSConfig extends Config(
+  new WithDifftestSBoomLoadQueue(16) ++
+  new QuadSmallBoomV4Mshr8DifftestSConfig
+)
