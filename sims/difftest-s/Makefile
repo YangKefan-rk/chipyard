@@ -36,7 +36,7 @@ difftest_s_host_dir := $(abspath $(DIFFTEST_S_DIR))/src/test/csrc/difftest
 # symbols before the selected profile library. Native HTIF still uses libfesvr.
 override LRISCV :=
 ifeq ($(DIFFTEST_S_DUT),boom)
-difftest_s_native_sources := boom_native_decoder boom_native_source boom_semantic_export boom_session_sink
+difftest_s_native_sources := boom_native_decoder boom_native_source boom_semantic_export boom_semantic_long_export boom_session_sink
 difftest_s_adapter_sources := native_collector retirement_snapshot word_bytes boom_event_adapter
 else
 difftest_s_native_sources := rocket_native_decoder rocket_session_sink
@@ -49,6 +49,9 @@ EXTRA_SIM_SOURCES += $(difftest_s_host_dir)/globalmem_storage.cpp
 EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_host_dir)/rvwmo/,$(addsuffix .cpp,host_session memory_image spike_reference_pool spike_reference_stepper session stream checker_event_consumer checker memory ppo dependency lrsc))
 EXTRA_SIM_SOURCES += $(addprefix $(difftest_s_host_dir)/adapters/$(DIFFTEST_S_DUT)/,$(addsuffix .cpp,$(difftest_s_adapter_sources)))
 EXTRA_SIM_CXXFLAGS += -I$(abspath $(DIFFTEST_S_SPIKE_HOME))
+ifeq ($(DIFFTEST_S_DUT),boom)
+override EXTRA_SIM_LDFLAGS += -lsqlite3 -lcrypto
+endif
 override EXTRA_SIM_LDFLAGS += $(abspath $(DIFFTEST_S_SPIKE_LIBRARY)) -Wl,-rpath,$(abspath $(dir $(DIFFTEST_S_SPIKE_LIBRARY)))
 endif
 

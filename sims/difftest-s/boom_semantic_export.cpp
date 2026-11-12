@@ -1,4 +1,5 @@
 #include "boom_semantic_export.h"
+#include "boom_semantic_long_export.h"
 #include "rvwmo/host_session.h"
 #include "rvwmo/producer_ids.h"
 #include <algorithm>
@@ -30,6 +31,11 @@ std::string required(const char *name) {
   if (!value || !*value)
     throw std::invalid_argument(std::string("BOOM semantic feedback requires ") + name);
   return value;
+}
+
+bool chunked_export_requested() {
+  const char *width = std::getenv("DIFFTEST_S_SEMANTIC_CHUNK_CYCLES");
+  return width && *width;
 }
 
 uint64_t number(const char *name) {
@@ -151,7 +157,8 @@ BoomSemanticExport::BoomSemanticExport(const char *elf)
       elf_sha256_(required("SFUZZ_FUNCTIONAL_ELF_SHA256")),
       backend_sha256_(required("SFUZZ_FUNCTIONAL_SIMULATOR_SHA256")),
       layout_sha256_(required("DIFFTEST_S_SEMANTIC_LAYOUT_SHA256")),
-      last_cycle_(number("DIFFTEST_S_SEMANTIC_LAST_CYCLE")) {
+      last_cycle_(number(chunked_export_requested()
+          ? "DIFFTEST_S_SEMANTIC_MAX_CYCLE_BUDGET" : "DIFFTEST_S_SEMANTIC_LAST_CYCLE")) {
   if (!elf || !*elf || !std::filesystem::is_regular_file(elf) || run_id_.size() < 16 ||
       !last_cycle_ || case_id_.empty())
     throw std::invalid_argument("BOOM semantic export lacks a pinned ELF, run or window");
@@ -165,26 +172,51 @@ BoomSemanticExport::BoomSemanticExport(const char *elf)
           std::filesystem::weakly_canonical(functional.parent_path()) ||
       output.filename() != "interaction-feedback.json")
     throw std::invalid_argument("BOOM semantic output must share its pinned functional case directory");
+  if (chunked_export_requested()) {
+    if (std::getenv("DIFFTEST_S_SEMANTIC_LAST_CYCLE"))
+      throw std::invalid_argument("BOOM semantic v2 uses MAX_CYCLE_BUDGET, not LAST_CYCLE");
+    const uint64_t chunk_cycles = number("DIFFTEST_S_SEMANTIC_CHUNK_CYCLES");
+    const uint64_t first_cycle = number("DIFFTEST_S_SEMANTIC_FIRST_CYCLE");
+    const uint64_t max_pair_gap_cycles = number("DIFFTEST_S_SEMANTIC_MAX_PAIR_GAP_CYCLES");
+    if (!chunk_cycles || chunk_cycles > 1048576)
+      throw std::invalid_argument("BOOM semantic chunk cycles must be within 1..1048576");
+    long_export_ = std::make_unique<BoomSemanticLongExport>(output_, case_id_, run_id_,
+        elf_sha256_, backend_sha256_, layout_sha256_, first_cycle, last_cycle_, chunk_cycles, max_pair_gap_cycles);
+  }
 }
 
+BoomSemanticExport::~BoomSemanticExport() = default;
+
 void BoomSemanticExport::observe(const rvwmo::RuntimeEvent &event) {
+  if (long_export_) {
+    if (published_) throw std::runtime_error("BOOM semantic export was already published");
+    long_export_->observe(event);
+    return;
+  }
   if (published_ || observed_.size() >= kMaxObserved)
     throw std::runtime_error("BOOM semantic observer exhausted its bounded case-local storage");
   observed_.push_back(event);  // Never retain the ephemeral checker callback reference.
 }
 
 void BoomSemanticExport::publish(const rvwmo::HostSession &session) {
-  if (published_ || !session.semantic_feedback_publishable() ||
-      !session.semantic_completed_cycle() || *session.semantic_completed_cycle() < last_cycle_)
-    throw std::runtime_error("BOOM semantic export requires a complete independent checker Pass");
+  const auto completed = session.semantic_completed_cycle();
+  if (published_ || !session.semantic_feedback_publishable() || !completed ||
+      (long_export_ ? !*completed || *completed > last_cycle_ : *completed < last_cycle_))
+    throw std::runtime_error("BOOM semantic export requires a complete independent checker Pass within its pinned horizon");
+  const uint64_t horizon = long_export_ ? *completed : last_cycle_;
   const auto roster = producers();
   const auto &watermarks = session.semantic_source_watermarks();
   if (watermarks.size() != roster.size())
     throw std::runtime_error("BOOM semantic source roster is incomplete");
   for (const auto &producer : roster) {
     const auto watermark = watermarks.find(producer.id);
-    if (watermark == watermarks.end() || watermark->second.cycle < last_cycle_)
+    if (watermark == watermarks.end() || watermark->second.cycle < horizon)
       throw std::runtime_error("BOOM semantic source watermark does not close the scoring horizon");
+  }
+  if (long_export_) {
+    long_export_->publish(watermarks, horizon);
+    published_ = true;
+    return;
   }
   std::map<OperationId, rvwmo::RetiredInstruction> retired;
   std::map<OperationId, RetiredMemory> memory;

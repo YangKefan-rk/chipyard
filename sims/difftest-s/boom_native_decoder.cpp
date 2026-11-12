@@ -130,25 +130,153 @@ struct LoadFields : RecordFields {
 };
 
 struct StoreFields : RecordFields {
-  NativeField index, address, word, size, mask, atomic;
+  NativeField index, address, word, size, mask, atomic, command;
   StoreFields(const NativeFields &fields, const std::string &path)
       : RecordFields(fields, path), index(fields.field(path + ".bits.queue_index")),
         address(fields.field(path + ".bits.address")), word(fields.field(path + ".bits.word")),
         size(fields.field(path + ".bits.mem_size")), mask(fields.field(path + ".bits.byte_mask")),
-        atomic(fields.field(path + ".bits.atomic")) {}
+        atomic(fields.field(path + ".bits.atomic")), command(fields.field(path + ".bits.command")) {}
   boom::ProbeStore read(const Sample &sample) const {
     return {identity.read(sample), static_cast<uint32_t>(index.read(sample)), address.read(sample), word.read(sample),
             static_cast<uint8_t>(size.read(sample)), static_cast<uint8_t>(mask.read(sample)),
-            static_cast<bool>(atomic.read(sample))};
+            static_cast<bool>(atomic.read(sample)), static_cast<uint8_t>(command.read(sample))};
+  }
+};
+
+struct AtomicAppliedFields : RecordFields {
+  NativeField address, old_word, new_word, byte_mask, queue_index, mem_size, command, exclusive_valid;
+  AtomicAppliedFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), address(fields.field(path + ".bits.address")),
+        old_word(fields.field(path + ".bits.old_word")), new_word(fields.field(path + ".bits.new_word")),
+        byte_mask(fields.field(path + ".bits.byte_mask")),
+        queue_index(fields.field(path + ".bits.queue_index")),
+        mem_size(fields.field(path + ".bits.mem_size")), command(fields.field(path + ".bits.command")),
+        exclusive_valid(fields.field(path + ".bits.exclusive_valid")) {}
+  boom::NativeAtomicApplied read(const Sample &sample) const {
+    boom::NativeAtomicApplied effect;
+    effect.identity = identity.read(sample);
+    effect.source_cycle = cycle.read(sample);
+    effect.address = address.read(sample);
+    effect.old_word = old_word.read(sample);
+    effect.new_word = new_word.read(sample);
+    effect.byte_mask = static_cast<uint8_t>(byte_mask.read(sample));
+    effect.queue_index = static_cast<uint32_t>(queue_index.read(sample));
+    effect.mem_size = static_cast<uint8_t>(mem_size.read(sample));
+    effect.command = static_cast<uint8_t>(command.read(sample));
+    effect.exclusive_valid = exclusive_valid.read(sample);
+    return effect;
+  }
+};
+
+struct DeviceStoreFields : RecordFields {
+  NativeField source_id, address, word, mask, size, tl_data, tl_mask, denied, corrupt;
+  DeviceStoreFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), source_id(fields.field(path + ".bits.source_id")),
+        address(fields.field(path + ".bits.address")), word(fields.field(path + ".bits.word")),
+        mask(fields.field(path + ".bits.byte_mask")), size(fields.field(path + ".bits.mem_size")),
+        tl_data(fields.field(path + ".bits.tl_data")), tl_mask(fields.field(path + ".bits.tl_mask")),
+        denied(fields.field(path + ".bits.denied")), corrupt(fields.field(path + ".bits.corrupt")) {}
+  BoomDeviceStoreFact read(const Sample &sample, uint64_t source_cycle, bool request) const {
+    require_current(sample, source_cycle);
+    BoomDeviceStoreFact result;
+    result.request = request;
+    result.identity = identity.read(sample);
+    result.source_cycle = cycle.read(sample);
+    result.tl_source = static_cast<uint32_t>(source_id.read(sample));
+    result.address = address.read(sample);
+    result.word = word.read(sample);
+    result.byte_mask = static_cast<uint8_t>(mask.read(sample));
+    result.mem_size = static_cast<uint8_t>(size.read(sample));
+    result.tl_data = tl_data.read(sample);
+    result.tl_mask = static_cast<uint8_t>(tl_mask.read(sample));
+    result.denied = denied.read(sample);
+    result.corrupt = corrupt.read(sample);
+    if (!result.identity.uid || !result.identity.epoch || (request && (result.denied || result.corrupt)))
+      throw std::invalid_argument("BOOM MMIO probe has missing identity or impossible TL A status");
+    return result;
+  }
+};
+
+struct TrapPostFields : RecordFields {
+  NativeField pc, cause, target_pc, privilege, mstatus, mepc, mcause, mtval, sepc, scause, stval;
+  TrapPostFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), pc(fields.field(path + ".bits.pc")),
+        cause(fields.field(path + ".bits.cause")), target_pc(fields.field(path + ".bits.target_pc")),
+        privilege(fields.field(path + ".bits.privilege")), mstatus(fields.field(path + ".bits.mstatus")),
+        mepc(fields.field(path + ".bits.mepc")), mcause(fields.field(path + ".bits.mcause")),
+        mtval(fields.field(path + ".bits.mtval")), sepc(fields.field(path + ".bits.sepc")),
+        scause(fields.field(path + ".bits.scause")), stval(fields.field(path + ".bits.stval")) {}
+  boom::NativeTrapPost read(const Sample &sample) const {
+    return {identity.read(sample), cycle.read(sample), pc.read(sample), cause.read(sample),
+            target_pc.read(sample), privilege.read(sample), mstatus.read(sample), mepc.read(sample),
+            mcause.read(sample), mtval.read(sample), sepc.read(sample), scause.read(sample), stval.read(sample)};
+  }
+};
+
+struct CsrPostFields : RecordFields {
+  NativeField pc, value, address;
+  CsrPostFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), pc(fields.field(path + ".bits.pc")),
+        value(fields.field(path + ".bits.value")),
+        address(fields.field(path + ".bits.address")) {}
+  boom::NativeCsrPost read(const Sample &sample) const {
+    return {identity.read(sample), cycle.read(sample), pc.read(sample), value.read(sample),
+            static_cast<uint16_t>(address.read(sample))};
+  }
+};
+
+
+struct FpPostFields : RecordFields {
+  NativeField pc, fcsr, mstatus;
+  FpPostFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), pc(fields.field(path + ".bits.pc")),
+        fcsr(fields.field(path + ".bits.fcsr")), mstatus(fields.field(path + ".bits.mstatus")) {}
+  boom::NativeFpPost read(const Sample &sample) const {
+    return {identity.read(sample), cycle.read(sample), pc.read(sample), fcsr.read(sample), mstatus.read(sample)};
+  }
+};
+struct WfiParkFields {
+  NativeField valid, cycle, csr_wait, rob_only_entry, interrupt_pending, writeback_active;
+  NativeField marker_pc, marker_instruction, marker_architectural;
+  IdentityFields marker_identity;
+  WfiParkFields(const NativeFields &fields, const std::string &path)
+      : valid(fields.field(path + ".valid")), cycle(fields.field(path + ".source_cycle")),
+        csr_wait(fields.field(path + ".csr_wait")), rob_only_entry(fields.field(path + ".rob_only_entry")),
+        interrupt_pending(fields.field(path + ".interrupt_pending")),
+        writeback_active(fields.field(path + ".writeback_active")),
+        marker_pc(fields.field(path + ".marker.pc")),
+        marker_instruction(fields.field(path + ".marker.instruction")),
+        marker_architectural(fields.field(path + ".marker.architectural")),
+        marker_identity(fields, path + ".marker.identity") {}
+  BoomWfiParkFacts read(const Sample &sample, uint64_t source_cycle) const {
+    BoomWfiParkFacts result;
+    result.available = true;
+    result.valid = valid.read(sample);
+    if (!result.valid)
+      return result;
+    result.source_cycle = cycle.read(sample);
+    result.csr_wait = csr_wait.read(sample);
+    result.rob_only_entry = rob_only_entry.read(sample);
+    result.interrupt_pending = interrupt_pending.read(sample);
+    result.writeback_active = writeback_active.read(sample);
+    result.marker = marker_identity.read(sample);
+    result.marker_pc = marker_pc.read(sample);
+    result.marker_instruction = static_cast<uint32_t>(marker_instruction.read(sample));
+    if (result.source_cycle != source_cycle || !result.marker.uid || result.marker_pc % 2 ||
+        result.marker_instruction != 0x10500073 || marker_architectural.read(sample) ||
+        !result.csr_wait || !result.rob_only_entry || result.interrupt_pending || result.writeback_active)
+      throw std::invalid_argument("BOOM WFI park lacks a live unretired unique ROB/CSR-stall witness");
+    return result;
   }
 };
 
 struct SquashFields : RecordFields {
-  NativeField rob;
+  NativeField rob, rollback;
   SquashFields(const NativeFields &fields, const std::string &path)
-      : RecordFields(fields, path), rob(fields.field(path + ".bits.rob_index")) {}
+      : RecordFields(fields, path), rob(fields.field(path + ".bits.rob_index")),
+        rollback(fields.field(path + ".bits.rollback")) {}
   boom::NativeSquash read(const Sample &sample) const {
-    return {identity.read(sample), static_cast<uint32_t>(rob.read(sample))};
+    return {identity.read(sample), static_cast<uint32_t>(rob.read(sample)), rollback.read(sample) != 0};
   }
 };
 
@@ -178,6 +306,8 @@ struct BoomNativeDecoder::Fields {
   NativeFields metadata;
   NativeField hart, queues_empty, cache_idle;
   RecordFields trap;
+  NativeField trap_pc, trap_cause;
+  std::optional<TrapPostFields> trap_post;
   std::vector<InstructionFields> allocate, retire;
   std::vector<QueueFields> queues;
   std::vector<AttemptFields> begin, cancel, nack, retired_load;
@@ -187,14 +317,22 @@ struct BoomNativeDecoder::Fields {
   std::vector<NativeField> retire_data;
   AttemptFields release;
   StoreFields publication;
+  std::optional<AtomicAppliedFields> atomic_applied;
   NativeField terminal_armed, terminal_pc, terminal_reached, terminal_stopped, terminal_empty;
   NativeField terminal_writeback, terminal_interrupt, terminal_cycle, marker_cycle, marker_pc, marker_instruction;
   IdentityFields marker_identity;
+  std::optional<WfiParkFields> wfi;
+  std::optional<CsrPostFields> csr_post;
+  std::optional<CsrPostFields> csr_write_post;
+  std::optional<CsrPostFields> counter_read;
+  std::vector<FpPostFields> fp_post;
+  std::vector<DeviceStoreFields> mmio_requests, mmio_acks;
 
   Fields(const NativeProbeLayout &source, BoomPublicationSource publications)
       : layout(&source), publication_source(std::move(publications)), metadata(source),
         hart(metadata.field("core.hartid")), queues_empty(metadata.field("lsu.queues_empty")),
         cache_idle(metadata.field("cache.idle")), trap(metadata, "core.trap"),
+        trap_pc(metadata.field("core.trap.bits.pc")), trap_cause(metadata.field("core.trap.bits.cause")),
         allocate(vector_fields<InstructionFields>(metadata, "core.allocate")),
         retire(vector_fields<InstructionFields>(metadata, "core.retire")),
         queues(vector_fields<QueueFields>(metadata, "lsu.allocate")),
@@ -216,6 +354,30 @@ struct BoomNativeDecoder::Fields {
         marker_pc(metadata.field("core.terminal.marker.pc")),
         marker_instruction(metadata.field("core.terminal.marker.instruction")),
         marker_identity(metadata, "core.terminal.marker.identity") {
+    if (metadata.has_field("cache.atomic_applied.valid"))
+      atomic_applied.emplace(metadata, "cache.atomic_applied");
+    if (metadata.has_field("core.trap_post.valid"))
+      trap_post.emplace(metadata, "core.trap_post");
+    if (metadata.has_field("core.wfi_park.valid"))
+      wfi.emplace(metadata, "core.wfi_park");
+    if (metadata.has_field("core.csr_post.valid"))
+      csr_post.emplace(metadata, "core.csr_post");
+    if (metadata.has_field("core.csr_write_post.valid"))
+      csr_write_post.emplace(metadata, "core.csr_write_post");
+    if (metadata.has_field("core.counter_read.valid"))
+      counter_read.emplace(metadata, "core.counter_read");
+    if (metadata.has_field("core.fp_post[0].valid"))
+      fp_post = vector_fields<FpPostFields>(metadata, "core.fp_post");
+    const bool requests = metadata.has_field("cache.mmio_request[0].valid");
+    const bool acknowledgments = metadata.has_field("cache.mmio_ack[0].valid");
+    if (requests != acknowledgments)
+      throw std::invalid_argument("BOOM MMIO probe lacks either its TL A or D vector");
+    if (requests) {
+      mmio_requests = vector_fields<DeviceStoreFields>(metadata, "cache.mmio_request");
+      mmio_acks = vector_fields<DeviceStoreFields>(metadata, "cache.mmio_ack");
+      if (mmio_requests.size() != mmio_acks.size())
+        throw std::invalid_argument("BOOM MMIO probe source roster differs between TL A and D");
+    }
     if (source.kind != 2 || !publication_source)
       throw std::invalid_argument("BOOM native decoder requires BOOM metadata and a fabric source allocator");
     for (size_t lane = 0; lane < retired_load.size(); ++lane)
@@ -232,6 +394,40 @@ struct BoomNativeDecoder::Fields {
     capture_current(sample, frame.cycle, nack, frame.cancellations);
     capture_current(sample, frame.cycle, local_store, frame.local_stores);
     capture_current(sample, frame.cycle, retire, frame.retirements);
+    frame.csr_probe_available = csr_post.has_value();
+    if (csr_post && csr_post->valid.read(sample)) {
+      auto observation = csr_post->read(sample);
+      if (!observation.source_cycle || observation.source_cycle == UINT64_MAX ||
+          observation.source_cycle + 1 != frame.cycle)
+        throw std::invalid_argument("BOOM CSR observation is not one cycle after its retired owner");
+      frame.csr_post = observation;
+    }
+    frame.counter_read_probe_available = counter_read.has_value();
+    if (counter_read && counter_read->valid.read(sample)) {
+      auto observation = counter_read->read(sample);
+      if (!observation.source_cycle || observation.source_cycle == UINT64_MAX ||
+          observation.source_cycle + 1 != frame.cycle)
+        throw std::invalid_argument("BOOM counter read is not one cycle after its execution sample");
+      frame.counter_read = observation;
+    }
+    frame.csr_write_probe_available = csr_write_post.has_value();
+    frame.fp_probe_available = !fp_post.empty();
+    for (const auto &field : fp_post) {
+      if (!field.valid.read(sample))
+        continue;
+      auto observation = field.read(sample);
+      if (!observation.source_cycle || observation.source_cycle == UINT64_MAX ||
+          observation.source_cycle + 1 != frame.cycle)
+        throw std::invalid_argument("BOOM FP observation is not one cycle after its retired owner");
+      frame.fp_posts.push_back(observation);
+    }
+    if (csr_write_post && csr_write_post->valid.read(sample)) {
+      auto observation = csr_write_post->read(sample);
+      if (!observation.source_cycle || observation.source_cycle == UINT64_MAX ||
+          observation.source_cycle + 1 != frame.cycle)
+        throw std::invalid_argument("BOOM counter CSR sample is not one cycle after the accepted write");
+      frame.csr_write_post = observation;
+    }
     capture_current(sample, frame.cycle, squash, frame.squashes);
     for (const auto &field : complete)
       if (field.valid.read(sample))
@@ -248,23 +444,57 @@ struct BoomNativeDecoder::Fields {
       release.require_current(sample, frame.cycle);
       frame.store_releases.push_back(release.read(sample));
     }
-    if (publication.valid.read(sample)) {
+    const bool accepted_atomic = atomic_applied && atomic_applied->valid.read(sample);
+    const bool accepted_write = publication.valid.read(sample);
+    if (accepted_atomic && !accepted_write)
+      throw std::invalid_argument("BOOM AMO effect has no matching exclusive data-array write");
+    if (accepted_write) {
       publication.require_current(sample, frame.cycle);
-      // Each observed scalar data-array write carries one native STQ writer,
-      // including per-request MSHR replay. This is not an ACK or a slot release.
+      const auto physical = publication.read(sample);
+      // Both records arise from the same exclusive dataWriteArb.fire. Never
+      // count an AMO again as an ordinary StorePublish.
+      if (accepted_atomic) {
+        atomic_applied->require_current(sample, frame.cycle);
+        auto rmw = atomic_applied->read(sample);
+        const auto &lhs = rmw.identity;
+        const auto &rhs = physical.identity;
+        if (!physical.atomic || lhs.epoch != rhs.epoch || lhs.uid != rhs.uid ||
+            lhs.rob_generation != rhs.rob_generation ||
+            lhs.memory_generation != rhs.memory_generation || lhs.attempt != rhs.attempt ||
+            rmw.address != physical.address || rmw.new_word != physical.word ||
+            rmw.byte_mask != physical.byte_mask || rmw.queue_index != physical.queue_index ||
+            rmw.mem_size != physical.log2_size || rmw.command != physical.command)
+          throw std::invalid_argument("BOOM AMO effect disagrees with its physical cache write");
+      }
       auto source = publication_source(frame.cycle);
       if (source.position.cycle != frame.cycle)
         throw std::invalid_argument("BOOM fabric source allocator changed the hardware publication cycle");
-      // dataWriteArb.fire writes the exclusive data array at this active edge.
-      // Different L1s share phase 1, so this does not order their writes.
       source.position.qualified_phase = 1;
-      source.position.order_qualified = true;
-      frame.publications.push_back({publication.read(sample), source,
-          source.position.producer_sequence, boom::StorePublicationEvidence::ExclusiveCacheDataWrite, true});
+      if (accepted_atomic) {
+        auto rmw = atomic_applied->read(sample);
+        source.position.order_qualified = rmw.exclusive_valid;
+        rmw.source = source;
+        frame.atomic_applied.push_back(std::move(rmw));
+      } else {
+        // An unpaired atomic store remains unsupported in the private adapter.
+        source.position.order_qualified = true;
+        frame.publications.push_back({physical, source, source.position.producer_sequence,
+            boom::StorePublicationEvidence::ExclusiveCacheDataWrite, true});
+      }
     }
-    frame.trap = trap.valid.read(sample);
-    if (frame.trap)
+    frame.trap_post_probe_available = trap_post.has_value();
+    if (trap_post && trap_post->valid.read(sample)) {
+      auto observation = trap_post->read(sample);
+      if (!observation.source_cycle || observation.source_cycle > frame.cycle ||
+          frame.cycle - observation.source_cycle != 2)
+        throw std::invalid_argument("BOOM trap post-state is not two edges after its physical trap owner");
+      frame.trap_post = observation;
+    }
+    if (trap.valid.read(sample)) {
       trap.require_current(sample, frame.cycle);
+      frame.trap = boom::NativeTrap{trap.identity.read(sample), frame.cycle,
+                                    trap_pc.read(sample), trap_cause.read(sample)};
+    }
     frame.queues_empty = queues_empty.read(sample);
     frame.cache_idle = cache_idle.read(sample);
   }
@@ -304,6 +534,39 @@ rvwmo::CheckResult BoomNativeDecoder::terminal(const NativeFrame &source, BoomTe
       static_cast<uint32_t>(fields_->marker_instruction.read(sample))};
     if (output.source_cycle != source.source_cycle)
       return {rvwmo::CheckStatus::Invalid, 0, "BOOM terminal facts differ from the actual source edge"};
+    return {};
+  } catch (const std::exception &error) {
+    return {rvwmo::CheckStatus::Invalid, 0, error.what()};
+  }
+}
+rvwmo::CheckResult BoomNativeDecoder::wfi_park(const NativeFrame &source, BoomWfiParkFacts &output) const {
+  try {
+    output = {};
+    if (!fields_->wfi)
+      return {}; // Missing hardware witness remains unavailable to the host.
+    output = fields_->wfi->read(source.samples.at(fields_->layout->hart), source.source_cycle);
+    return {};
+  } catch (const std::exception &error) {
+    return {rvwmo::CheckStatus::Invalid, 0, error.what()};
+  }
+}
+rvwmo::CheckResult BoomNativeDecoder::device_stores(const NativeFrame &source,
+    std::vector<BoomDeviceStoreFact> &output, bool &probe_available) const {
+  try {
+    std::vector<BoomDeviceStoreFact> decoded;
+    probe_available = !fields_->mmio_requests.empty();
+    if (!probe_available) {
+      output.clear();
+      return {}; // Old RTL lacks this witness; never claim an MMIO audit.
+    }
+    const auto &sample = source.samples.at(fields_->layout->hart);
+    for (const auto &record : fields_->mmio_requests)
+      if (record.valid.read(sample))
+        decoded.push_back(record.read(sample, source.source_cycle, true));
+    for (const auto &record : fields_->mmio_acks)
+      if (record.valid.read(sample))
+        decoded.push_back(record.read(sample, source.source_cycle, false));
+    output = std::move(decoded);
     return {};
   } catch (const std::exception &error) {
     return {rvwmo::CheckStatus::Invalid, 0, error.what()};

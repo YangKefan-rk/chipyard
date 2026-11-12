@@ -3,18 +3,21 @@
 
 #include "rvwmo/event.h"
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace rvwmo { class HostSession; }
 
 namespace difftest_s::native {
+class BoomSemanticLongExport;
 
 // Only a source-closed checker-accepted tap. Feedback never supplies a REF
 // value, a memory-order edge or a successful checker certificate.
 class BoomSemanticExport {
 public:
   explicit BoomSemanticExport(const char *elf);
+  ~BoomSemanticExport();
   void observe(const rvwmo::RuntimeEvent &event);
   void publish(const rvwmo::HostSession &session);
 
@@ -23,6 +26,7 @@ private:
   uint64_t last_cycle_ = 0;
   bool published_ = false;
   std::vector<rvwmo::RuntimeEvent> observed_;
+  std::unique_ptr<BoomSemanticLongExport> long_export_;
 };
 
 } // namespace difftest_s::native

@@ -33,6 +33,11 @@ void select_entry_scope(boom::NativeFrame &frame, uint64_t entry_uid) {
   exclude_bootstrap(frame.retired_loads, entry_uid, identity);
   exclude_bootstrap(frame.store_releases, entry_uid, identity);
   exclude_bootstrap(frame.squashes, entry_uid, identity);
+  exclude_bootstrap(frame.atomic_applied, entry_uid, identity);
+  if (frame.trap && frame.trap->identity.uid < entry_uid)
+    frame.trap.reset();
+  if (frame.trap_post && frame.trap_post->identity.uid < entry_uid)
+    frame.trap_post.reset();
   const auto probe_identity = [](const auto &record) { return record.probe.identity; };
   exclude_bootstrap(frame.completions, entry_uid, probe_identity);
   exclude_bootstrap(frame.publications, entry_uid, probe_identity);
@@ -42,7 +47,8 @@ void select_entry_scope(boom::NativeFrame &frame, uint64_t entry_uid) {
 BoomNativeSource::BoomNativeSource(BoomNativeSourceConfiguration configuration)
     : configuration_(std::move(configuration)), collectors_(configuration_.entry_pcs.size()),
       entry_uids_(collectors_.size()), watermarks_(collectors_.size()), bootstrap_(collectors_.size()),
-      terminal_facts_(collectors_.size()), terminal_retirements_(collectors_.size()),
+      terminal_facts_(collectors_.size()), wfi_park_facts_(collectors_.size()),
+      terminal_retirements_(collectors_.size()),
       terminal_retirement_cycles_(collectors_.size()) {
   if (!configuration_.epoch || collectors_.empty() || collectors_.size() > 256 || !configuration_.staged_events)
     throw std::invalid_argument("BOOM native source requires a bounded hart roster, epoch and staging limit");
@@ -79,21 +85,32 @@ CheckResult BoomNativeSource::capture(const NativeFrame &frame) {
     auto result = decoders_[hart]->decode(frame, decoded);
     if (result)
       result = decoders_[hart]->terminal(frame, terminal_facts_[hart]);
-    if (!result || !(result = capture_hart(std::move(decoded))))
+    if (result)
+      result = decoders_[hart]->wfi_park(frame, wfi_park_facts_[hart]);
+    std::vector<BoomDeviceStoreFact> device_events;
+    bool device_probe_available = false;
+    if (result)
+      result = decoders_[hart]->device_stores(frame, device_events, device_probe_available);
+    if (!result)
+      return remember_failure(result);
+    if (!device_probe_available && !device_events.empty())
+      return remember_failure(invalid("BOOM MMIO event has no complete physical probe layout"));
+    if (!(result = capture_hart(std::move(decoded), device_events)))
       return remember_failure(result);
   }
   captured_cycle_ = frame.source_cycle;
   return {};
 }
 
-CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame) {
+CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
+                                           const std::vector<BoomDeviceStoreFact> &device_events) {
   const auto hart = frame.hart;
   if (!entry_uids_[hart]) {
     auto &outside = bootstrap_[hart];
     outside.instructions += frame.retirements.size();
     outside.loads += frame.completions.size();
     outside.stores += frame.publications.size();
-    outside.traps += frame.trap;
+    outside.traps += frame.trap.has_value();
     // Bootstrap RAM writes require an explicit initialized-state contract. This
     // source deliberately does not derive reference RAM from observed DUT data.
     if (!frame.publications.empty())
@@ -110,14 +127,71 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame) {
       config.initial_cycle = frame.cycle;
       config.limits = configuration_.limits;
       config.staged_events = configuration_.staged_events;
+      config.checked_ram_base = configuration_.checked_ram_base;
+      config.checked_ram_size = configuration_.checked_ram_size;
+      config.skip_device_stores = configuration_.skip_device_stores;
+      config.check_csr_post = configuration_.check_csr_post;
+      config.check_counter_reads = configuration_.check_counter_reads;
+      config.check_fp_post = configuration_.check_fp_post;
+      config.terminal_wfi_pcs = configuration_.terminal_wfi_pcs;
       collectors_[hart] = std::make_unique<boom::NativeCollector>(config);
     }
     if (!entry_uids_[hart]) {
+      for (const auto &device : device_events) {
+        if (device.request)
+          ++outside.mmio_store_requests;
+        else
+          ++outside.mmio_store_acks;
+      }
       watermarks_[hart] = frame.cycle;
       return {};
     }
   }
+  for (const auto &device : device_events) {
+    if (device.identity.uid < entry_uids_[hart]) {
+      // BOOTROM MMIO is explicitly outside the independently initialized
+      // DRAM-entry scope. Track late ACKs by UID, not by their delivery time.
+      if (device.request)
+        ++bootstrap_[hart].mmio_store_requests;
+      else
+        ++bootstrap_[hart].mmio_store_acks;
+      continue;
+    }
+    // LinkNan-style opt-in: this device write is outside coherent RAM and
+    // REF value comparison, but source identity and TL A/D delivery must close.
+    if (!configuration_.skip_device_stores)
+      return {CheckStatus::Unsupported, 0, "BOOM uncached TL store awaits device policy"};
+    const uint64_t own_timer = UINT64_C(0x02004000) + 8 * hart;
+    if (device.address != own_timer || device.mem_size != 3 ||
+        device.byte_mask != UINT8_MAX || (device.request && device.tl_mask != UINT8_MAX) ||
+        device.denied || device.corrupt)
+      return {CheckStatus::Unsupported, 0,
+              "BOOM device-store skip rejected physical request/ACK: hart=" + std::to_string(hart) +
+              " uid=" + std::to_string(device.identity.uid) + " address=" + std::to_string(device.address) +
+              " mem_size=" + std::to_string(device.mem_size) + " mask=" + std::to_string(device.byte_mask) +
+              " tl_mask=" + std::to_string(device.tl_mask) + " denied=" + std::to_string(device.denied) +
+              " corrupt=" + std::to_string(device.corrupt)};
+    const rvwmo::OperationId id{hart, device.identity.epoch, device.identity.uid, 0};
+    if (device.request) {
+      if (!device_requests_.emplace(id, device.tl_source).second)
+        return invalid("BOOM device-store skip repeats a TL A request identity");
+    } else {
+      auto request = device_requests_.find(id);
+      if (request == device_requests_.end() || request->second != device.tl_source ||
+          !device_acks_.insert(id).second)
+        return invalid("BOOM device-store skip has no matching unique TL A/D identity");
+      device_requests_.erase(request);
+    }
+  }
   select_entry_scope(frame, entry_uids_[hart]);
+  if (frame.csr_post && frame.csr_post->identity.uid < entry_uids_[hart])
+    frame.csr_post.reset();
+  if (frame.csr_write_post && frame.csr_write_post->identity.uid < entry_uids_[hart])
+    frame.csr_write_post.reset();
+  if (frame.counter_read && frame.counter_read->identity.uid < entry_uids_[hart])
+    frame.counter_read.reset();
+  frame.fp_posts.erase(std::remove_if(frame.fp_posts.begin(), frame.fp_posts.end(),
+      [&](const auto &post) { return post.identity.uid < entry_uids_[hart]; }), frame.fp_posts.end());
   if (configuration_.terminal_pc) {
     const auto &facts = terminal_facts_[hart];
     if (!facts.armed || facts.configured_pc != configuration_.terminal_pc)
@@ -144,6 +218,18 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame) {
     }
   }
   const auto captured = collectors_[hart]->capture(frame);
+  if (captured.accepted && configuration_.skip_device_stores)
+    for (const auto &store : frame.local_stores) {
+      if (store.address >= configuration_.checked_ram_base &&
+          store.address < configuration_.checked_ram_base + configuration_.checked_ram_size)
+        continue;
+      if (store.address != UINT64_C(0x02004000) + 8 * hart ||
+          store.log2_size != 3 || store.byte_mask != UINT8_MAX)
+        return {CheckStatus::Unsupported, 0, "BOOM skipped local store is not this hart's full-width CLINT timer write"};
+      const rvwmo::OperationId id{hart, store.identity.epoch, store.identity.uid, 0};
+      if (!skipped_device_stores_.insert(id).second)
+        return invalid("BOOM device-store skip repeats a local store identity");
+    }
   if (!captured.accepted)
     return captured.check.status == CheckStatus::Pending
                ? incomplete("BOOM source collector could not accept its complete native frame") : captured.check;
@@ -165,6 +251,9 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame) {
   for (const auto &snapshot : ready.retirements)
     if (!snapshots_.emplace(snapshot.id, snapshot).second)
       return invalid("BOOM source repeats an architectural retirement snapshot");
+  for (const auto &trap : ready.traps)
+    if (!traps_.emplace(trap.id, trap).second)
+      return invalid("BOOM source repeats a physical trap post-state snapshot");
   return {};
 }
 
@@ -186,15 +275,26 @@ CheckResult BoomNativeSource::take_ready(boom::CollectedObservations &output) {
     if (event.source.cycle > through)
       continue;
     auto converted = event;
-    if (event.kind == rvwmo::RuntimeEventKind::StorePublish) {
+    const bool atomic_effect = event.kind == rvwmo::RuntimeEventKind::AtomicLifecycle &&
+        std::get<rvwmo::AtomicLifecycleEvent>(event.payload).phase == rvwmo::AtomicObservationPhase::RmwEffect;
+    if (event.kind == rvwmo::RuntimeEventKind::StorePublish || atomic_effect) {
       if (next_fabric_sequence == UINT64_MAX)
         return remember_failure(invalid("BOOM public fabric source sequence exhausted"));
-      // One channel per native L1 preserves its single write port. Cross-L1
-      // simultaneous writes remain on distinct unqualified producers. Delivery
-      // numbering within each channel never creates a cross-L1 GMO phase.
+      // Renumber all physical L1 effects together after delayed frames have
+      // joined the closed prefix. Their captured sequence may include effects
+      // outside the checked scope, while one producer must never reuse a rank.
       converted.source.producer_sequence = ++next_fabric_sequence;
-      for (auto &member : std::get<rvwmo::StorePublishEvent>(converted.payload).members)
-        member.publish_position = converted.source;
+      if (event.kind == rvwmo::RuntimeEventKind::StorePublish)
+        for (auto &member : std::get<rvwmo::StorePublishEvent>(converted.payload).members)
+          member.publish_position = converted.source;
+    }
+    if (event.kind == rvwmo::RuntimeEventKind::Trap) {
+      const auto &trap = std::get<rvwmo::TrapEvent>(event.payload);
+      const auto snapshot = traps_.find(trap.instruction);
+      if (snapshot == traps_.end())
+        return remember_failure(invalid("BOOM precise trap has no matched physical post-state"));
+      ready.traps.push_back(snapshot->second);
+      retired.push_back(trap.instruction);
     }
     if (event.kind == rvwmo::RuntimeEventKind::InstructionRetire) {
       const auto &instruction = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction;
@@ -214,6 +314,8 @@ CheckResult BoomNativeSource::take_ready(boom::CollectedObservations &output) {
   events_.erase(std::remove_if(events_.begin(), events_.end(), [through](const auto &event) {
     return event.source.cycle <= through;
   }), events_.end());
+  for (const auto &trap : ready.traps)
+    traps_.erase(trap.id);
   for (const auto &id : retired)
     snapshots_.erase(id);
   emitted_publication_sequence_ = next_fabric_sequence;
@@ -231,11 +333,34 @@ CheckResult BoomNativeSource::audit_reference_store(const rvwmo::ReferenceStoreV
       {store.id, store.address, store.bytes, store.byte_mask}));
 }
 
+CheckResult BoomNativeSource::certify_wfi_terminals() {
+  if (!failure_)
+    return failure_;
+  if (configuration_.terminal_wfi_pcs.empty())
+    return {CheckStatus::Unsupported, 0, "BOOM source has no independently verified WFI terminal profile"};
+  if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
+      !events_.empty() || !snapshots_.empty() || !traps_.empty())
+    return incomplete("BOOM source has not delivered its final WFI-cycle event prefix");
+  for (uint32_t hart = 0; hart < collectors_.size(); ++hart) {
+    const auto &park = wfi_park_facts_[hart];
+    if (!collectors_[hart] || !park.available || !park.valid ||
+        park.source_cycle != *captured_cycle_ || !park.csr_wait || !park.rob_only_entry ||
+        park.interrupt_pending || park.writeback_active || park.marker_instruction != 0x10500073 ||
+        std::find(configuration_.terminal_wfi_pcs.begin(), configuration_.terminal_wfi_pcs.end(),
+                  park.marker_pc) == configuration_.terminal_wfi_pcs.end())
+      return incomplete("BOOM WFI terminal lacks four current matching physical ROB park witnesses");
+    auto result = collectors_[hart]->certify_parked_wfi_terminal(park.marker, park.marker_pc, park.source_cycle);
+    if (!result)
+      return result;
+  }
+  return {};
+}
+
 CheckResult BoomNativeSource::completion() const {
   if (!failure_)
     return failure_;
   if (!captured_cycle_ || !closed_cycle_ || *captured_cycle_ != *closed_cycle_ ||
-      !events_.empty() || !snapshots_.empty())
+      !events_.empty() || !snapshots_.empty() || !traps_.empty())
     return incomplete("BOOM native source still has undelivered events or snapshots");
   if (configuration_.terminal_pc)
     for (uint32_t hart = 0; hart < collectors_.size(); ++hart) {
@@ -244,6 +369,8 @@ CheckResult BoomNativeSource::completion() const {
           facts.writeback_active || facts.interrupt_pending || facts.source_cycle != *captured_cycle_)
         return incomplete("BOOM terminal retirement or current physical core drain is incomplete");
     }
+  if (configuration_.skip_device_stores && (!device_requests_.empty() || device_acks_ != skipped_device_stores_))
+    return incomplete("BOOM skipped device stores lack paired physical request and ACK evidence");
   for (const auto &collector : collectors_) {
     if (!collector)
       return incomplete("BOOM native hart never entered its independently initialized checked scope");

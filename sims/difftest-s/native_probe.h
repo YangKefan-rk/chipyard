@@ -15,6 +15,12 @@ struct NativeFieldSpec {
   uint32_t width;
 };
 
+struct NativeQueueCapacities {
+  uint32_t rob = 0;
+  uint32_t ldq = 0;
+  uint32_t stq = 0;
+};
+
 struct NativeProbeLayout {
   uint32_t abi_version;
   uint32_t kind;
@@ -26,6 +32,7 @@ struct NativeProbeLayout {
   // Generator certificate for the selected BOOM duplicated-array macro. Legacy
   // layouts default false; it never changes a DUT-supplied sampling cycle.
   bool sram_capture_boundary = false;
+  NativeQueueCapacities queue_capacity;
 };
 
 struct NativeHartSample {
@@ -58,13 +65,6 @@ const NativeProbeLayout *find_native_layout(uint32_t kind, uint32_t hart);
 // Native mains use a nonzero exit status unless ingress and its registered
 // Runtime finalizer both completed successfully. Capture alone is Incomplete.
 int native_exit_status();
-
-// Explicit verification shutdown control. This stops new instruction admission,
-// not clocks or cache traffic; source observations must prove the actual drain.
-bool enable_native_terminal_drain(uint32_t harts);
-void request_native_fetch_stop(uint32_t hart);
-void complete_native_terminal_drain();
-bool native_terminal_drain_complete();
 
 } // namespace difftest_s::native
 #endif

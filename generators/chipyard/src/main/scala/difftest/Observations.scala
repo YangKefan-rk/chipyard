@@ -34,18 +34,23 @@ class DifftestSRocketObservation(coreType: RocketCoreObservation, cacheType: DCa
   val stop = Input(Bool())
 }
 
-class DifftestSBoomObservation(coreWidth: Int, robEntries: Int, lsuWidth: Int) extends Bundle {
+class DifftestSBoomObservation(coreWidth: Int, robEntries: Int, lsuWidth: Int,
+                                cacheType: boom.v4.difftest.DifftestCacheObservation) extends Bundle {
   val source = new DifftestSSource
   val core = new boom.v4.difftest.DifftestCoreObservation(coreWidth, robEntries)
   val lsu = new boom.v4.difftest.DifftestLsuObservation(lsuWidth, coreWidth)
-  val cache = new boom.v4.difftest.DifftestCacheObservation(lsuWidth)
+  val cache = cacheType.cloneType
 }
 
 case class DifftestSRocketPort(getIO: () => DifftestSRocketObservation, tileId: Int)
     extends Port[DifftestSRocketObservation]
 
+case class DifftestSQueueCapacities(rob: Int, ldq: Int, stq: Int) {
+  require(rob > 0 && ldq > 0 && stq > 0, "Difftest-S queue capacities must come from the selected core")
+}
+
 case class DifftestSBoomPort(getIO: () => DifftestSBoomObservation, tileId: Int,
-                            sramCaptureBoundary: Boolean = false)
+                            sramCaptureBoundary: Boolean, queueCapacities: DifftestSQueueCapacities)
     extends Port[DifftestSBoomObservation]
 
 /** Private DUT observations. The source clock is exported; no receive-time
@@ -128,17 +133,22 @@ trait CanHaveDifftestSObservations { this: ChipyardSystem =>
           val core = boomTile.boomParams.core
           require(core.enableDifftest, "Difftest-S BOOM observations are not enabled")
           require(!core.clockGate, "Difftest-S BOOM observation export requires an ungated core clock")
-          val port = IO(Output(new DifftestSBoomObservation(core.decodeWidth, core.numRobEntries, core.lsuWidth)))
+          // Clone the real banked cache probe instead of guessing its TL widths.
+          val cache = boomTile.module.difftest_cache.getOrElse(
+            throw new IllegalArgumentException("Difftest-S BOOM cache observations are not enabled"))
+          val port = IO(Output(new DifftestSBoomObservation(core.decodeWidth, core.numRobEntries,
+            core.lsuWidth, cache)))
             .suggestName(s"difftest_s_boom_$tileId")
           source(port.source, boomTile.module.clock, boomTile.module.reset)
           port.core := BoringUtils.bore(boomTile.module.difftest_core.get)
           port.lsu := BoringUtils.bore(boomTile.module.difftest_lsu.get)
-          port.cache := BoringUtils.bore(boomTile.module.difftest_cache.get)
+          port.cache := BoringUtils.bore(cache)
           val control = boomControls(tileId).getWrappedValue
           BoringUtils.bore(port.source.epoch, Seq(control.epoch))
           BoringUtils.bore(port.source.cycle, Seq(control.cycle))
           DifftestSBoomPort(() => port, tileId,
-            core.difftestSramCaptureBoundary && core.numDCacheBanks == 1 && !core.dcacheSinglePorted)
+            core.difftestSramCaptureBoundary && core.numDCacheBanks == 1 && !core.dcacheSinglePorted,
+            DifftestSQueueCapacities(core.numRobEntries, core.numLdqEntries, core.numStqEntries))
 
         case other =>
           throw new IllegalArgumentException(s"Difftest-S observation export does not support ${other.getClass.getName}")
@@ -159,7 +169,7 @@ class WithDifftestSObservationPunchthrough extends OverrideLazyIOBinder({
         val port = IO(Output(chiselTypeOf(boom.getIO())))
           .suggestName(s"difftest_s_boom_${boom.tileId}")
         port := boom.getIO()
-        DifftestSBoomPort(() => port, boom.tileId, boom.sramCaptureBoundary)
+        DifftestSBoomPort(() => port, boom.tileId, boom.sramCaptureBoundary, boom.queueCapacities)
     }
     (ports, Nil)
   }
