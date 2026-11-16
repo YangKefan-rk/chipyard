@@ -114,6 +114,8 @@ OperationId instruction_id(OperationId id) {
 
 struct RetiredMemory {
   uint64_t pc = 0;
+  uint32_t instruction = 0;
+  uint64_t retirement_source_cycle = 0;
   rvwmo::MemoryOperation operation;
 };
 
@@ -198,9 +200,20 @@ void BoomSemanticExport::observe(const rvwmo::RuntimeEvent &event) {
   observed_.push_back(event);  // Never retain the ephemeral checker callback reference.
 }
 
+void BoomSemanticExport::observe_ordered(const rvwmo::RuntimeEvent &event,
+                                         const rvwmo::ObservationTime &order) {
+  if (long_export_ || (event.kind != RuntimeEventKind::LoadSample &&
+                       event.kind != RuntimeEventKind::StorePublish))
+    return;
+  if (published_ || !order.valid || !order.rank || ordered_.size() >= kMaxObserved ||
+      !ordered_.emplace(std::make_pair(event.producer_id, event.source.producer_sequence), order).second)
+    throw std::runtime_error("BOOM semantic accepted effect has no unique checker GMO rank");
+}
+
 void BoomSemanticExport::publish(const rvwmo::HostSession &session) {
   const auto completed = session.semantic_completed_cycle();
-  if (published_ || !session.semantic_feedback_publishable() || !completed ||
+  if (published_ || !session.semantic_feedback_publishable() ||
+      (!long_export_ && !session.ordered_semantic_observer_healthy()) || !completed ||
       (long_export_ ? !*completed || *completed > last_cycle_ : *completed < last_cycle_))
     throw std::runtime_error("BOOM semantic export requires a complete independent checker Pass within its pinned horizon");
   const uint64_t horizon = long_export_ ? *completed : last_cycle_;
@@ -234,7 +247,8 @@ void BoomSemanticExport::publish(const rvwmo::HostSession &session) {
       if (!retired.emplace(id, instruction).second)
         throw std::runtime_error("BOOM semantic instruction retired twice");
       for (const auto &operation : instruction.memory)
-        if (!memory.emplace(operation.id, RetiredMemory{instruction.pc, operation}).second)
+        if (!memory.emplace(operation.id, RetiredMemory{
+                instruction.pc, instruction.instruction, event.source.cycle, operation}).second)
           throw std::runtime_error("BOOM semantic retired memory operation repeated");
     }
   }
@@ -295,6 +309,8 @@ void BoomSemanticExport::publish(const rvwmo::HostSession &session) {
       row << "\"kind\":\"retired_load_sample\",\"retired\":true,\"hart\":" << id.hart
           << ",\"uid\":" << id.uid << ",\"attempt\":" << sample.attempt
           << ",\"subaccess\":" << id.subaccess << ",\"pc\":" << instruction->second.pc
+          << ",\"instruction\":" << operation->second.instruction
+          << ",\"retirement_source_cycle\":" << operation->second.retirement_source_cycle
           << ",\"physical_address\":" << sample.address
           << ",\"address_is_physical\":true,\"byte_mask\":" << byte_mask(sample.byte_mask, sample.address);
     } else {
@@ -320,11 +336,31 @@ void BoomSemanticExport::publish(const rvwmo::HostSession &session) {
             found->second.operation.attempt != member.attempt ||
             canceled.count({member.id, member.attempt}) || squashed.count(instruction_id(member.id)))
           throw std::runtime_error("BOOM semantic store member lacks its real retired writer attempt");
+        const auto &logical = found->second.operation;
+        byte_mask(logical.byte_mask, logical.address); // Validate the original scalar footprint.
+        if (store.byte_writers.size() != store.byte_mask.size())
+          throw std::runtime_error("BOOM coalesced group lacks a physical byte-writer roster");
+        uint32_t visible_member_mask = 0;
+        for (size_t byte = 0; byte < store.byte_mask.size(); ++byte) {
+          if (!store.byte_mask[byte] || store.byte_writers[byte] != member.id)
+            continue;
+          const uint64_t address = store.address + byte;
+          if (address < logical.address || address - logical.address >= logical.byte_mask.size() ||
+              !logical.byte_mask[address - logical.address])
+            throw std::runtime_error("BOOM physical byte writer differs from the retired member");
+          visible_member_mask |= uint32_t{1} << (address - logical.address);
+        }
         if (index) row << ',';
         row << "{\"hart\":" << hart << ",\"uid\":" << member.id.uid
             << ",\"attempt\":" << member.attempt
             << ",\"subaccess\":" << member.id.subaccess
-            << ",\"memory_generation\":" << member.memory_generation << ",\"retired\":true}";
+            << ",\"memory_generation\":" << member.memory_generation
+            << ",\"retired\":true,\"pc\":" << found->second.pc
+            << ",\"instruction\":" << found->second.instruction
+            << ",\"retirement_source_cycle\":" << found->second.retirement_source_cycle
+            << ",\"physical_address\":" << logical.address
+            << ",\"byte_mask\":" << visible_member_mask
+            << ",\"byte_provenance_verified\":true}";
       }
       row << ']';
       ++stores;
@@ -332,6 +368,10 @@ void BoomSemanticExport::publish(const rvwmo::HostSession &session) {
     phases.insert(position.qualified_phase);
     if (!emitted_sources.emplace(event.producer_id, position.producer_sequence).second)
       throw std::runtime_error("BOOM semantic producer sequence was exported twice");
+    const auto accepted = ordered_.find({event.producer_id, position.producer_sequence});
+    if (accepted == ordered_.end())
+      throw std::runtime_error("BOOM final semantic effect lacks a checker-accepted GMO rank");
+    const auto &order = accepted->second;
     if (!first) output << ',';
     first = false;
     output << "{\"producer_id\":" << json_string(producer)
@@ -339,7 +379,11 @@ void BoomSemanticExport::publish(const rvwmo::HostSession &session) {
            << ",\"source_cycle\":" << cycle
            << ",\"qualified_phase\":" << position.qualified_phase
            << ",\"source_clock\":" << json_string(kClock)
-           << ",\"epoch\":1,\"final_attempt\":true," << row.str() << '}';
+           << ",\"epoch\":1,\"final_attempt\":true,\"gmo\":{\"rank\":" << order.rank
+           << ",\"unordered_read_group\":" << (order.unordered_read_group ? "true" : "false")
+           << ",\"unordered_effect_group\":" << (order.unordered_effect_group ? "true" : "false")
+           << ",\"isolated_store_group\":" << (order.isolated_store_group ? "true" : "false")
+           << "}," << row.str() << '}';
   }
   output << "]}";
   write_exclusive(output_, output.str());

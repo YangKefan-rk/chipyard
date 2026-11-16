@@ -3,6 +3,7 @@
 
 #include "rvwmo/event.h"
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -19,6 +20,8 @@ public:
   explicit BoomSemanticExport(const char *elf);
   ~BoomSemanticExport();
   void observe(const rvwmo::RuntimeEvent &event);
+  bool supports_ordered() const { return !long_export_; }
+  void observe_ordered(const rvwmo::RuntimeEvent &event, const rvwmo::ObservationTime &order);
   void publish(const rvwmo::HostSession &session);
 
 private:
@@ -26,6 +29,7 @@ private:
   uint64_t last_cycle_ = 0;
   bool published_ = false;
   std::vector<rvwmo::RuntimeEvent> observed_;
+  std::map<std::pair<uint32_t, uint64_t>, rvwmo::ObservationTime> ordered_;
   std::unique_ptr<BoomSemanticLongExport> long_export_;
 };
 

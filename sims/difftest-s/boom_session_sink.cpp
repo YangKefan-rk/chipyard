@@ -182,10 +182,16 @@ public:
         first_tohost_store_ = store.id;
       return result;
     };
-    if (semantic_export_)
+    if (semantic_export_) {
       config.semantic_event_observer = [this](const rvwmo::RuntimeEvent &event) {
         semantic_export_->observe(event);
       };
+      if (semantic_export_->supports_ordered())
+        config.ordered_semantic_event_observer = [this](const rvwmo::RuntimeEvent &event,
+                                                       const rvwmo::ObservationTime &order) {
+          semantic_export_->observe_ordered(event, order);
+        };
+    }
     session_ = std::make_unique<rvwmo::HostSession>(memory_, std::move(config));
     if (!session_->configuration())
       throw std::invalid_argument("BOOM Runtime session: " + session_->configuration().message);
