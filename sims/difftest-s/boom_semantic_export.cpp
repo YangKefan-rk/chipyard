@@ -385,7 +385,53 @@ void BoomSemanticExport::publish(const rvwmo::HostSession &session) {
            << ",\"isolated_store_group\":" << (order.isolated_store_group ? "true" : "false")
            << "}," << row.str() << '}';
   }
-  output << "]}";
+  output << ']';
+  std::array<uint64_t, 4> retired_counts{}, ordinals{}, last_sequences{};
+  std::array<bool, 4> source_ordered{};
+  source_ordered.fill(true);
+  for (const auto &event : observed_)
+    if (event.kind == RuntimeEventKind::InstructionRetire) {
+      const auto &instruction = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction;
+      if (instruction.hart >= 4 || event.producer_id != rvwmo::hart_producer_id(instruction.hart) ||
+          event.source.cycle > *completed || !event.source.producer_sequence)
+        throw std::runtime_error("BOOM retirement has an unsupported source position");
+      auto &prior = last_sequences[instruction.hart];
+      source_ordered[instruction.hart] &= event.source.producer_sequence > prior;
+      prior = event.source.producer_sequence;
+      ++retired_counts[instruction.hart];
+    }
+  bool retirement_complete = true;
+  const auto &statistics = session.session()->hart_statistics();
+  for (uint32_t hart = 0; hart < 4; ++hart) {
+    const auto count = statistics.find(hart);
+    const auto mark = watermarks.find(rvwmo::hart_producer_id(hart));
+    retirement_complete &= retired_counts[hart] && source_ordered[hart] &&
+                           count != statistics.end() &&
+                           count->second.retired_instructions == retired_counts[hart] &&
+                           mark != watermarks.end() && mark->second.cycle >= *completed;
+  }
+  output << ",\"retirement_trace_complete\":" << (retirement_complete ? "true" : "false");
+  if (retirement_complete) {
+    output << ",\"retirement_source_clock\":" << json_string(kClock)
+           << ",\"retirement_closed_through_cycle\":" << *completed
+           << ",\"retirements\":[";
+    bool first_retirement = true;
+    for (const auto &event : observed_)
+      if (event.kind == RuntimeEventKind::InstructionRetire) {
+        const auto &instruction = std::get<rvwmo::InstructionRetireEvent>(event.payload).instruction;
+        if (!first_retirement) output << ',';
+        first_retirement = false;
+        output << "{\"hart\":" << instruction.hart << ",\"epoch\":" << instruction.epoch
+               << ",\"uid\":" << instruction.uid << ",\"pc\":" << instruction.pc
+               << ",\"instruction\":" << instruction.instruction
+               << ",\"source_cycle\":" << event.source.cycle
+               << ",\"producer_id\":" << json_string(producer_name(event.producer_id))
+               << ",\"producer_sequence\":" << event.source.producer_sequence
+               << ",\"program_order\":" << ordinals[instruction.hart]++ << '}';
+      }
+    output << ']';
+  }
+  output << '}';
   write_exclusive(output_, output.str());
   published_ = true;
   std::fprintf(stderr, "DIFFTEST_S_SEMANTIC_EXPORT {\"loads\":%zu,\"stores\":%zu,\"last_cycle\":%llu,\"phases\":[",

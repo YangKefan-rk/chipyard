@@ -86,8 +86,10 @@ public:
   // terminal Pass certificate; only publish() may expose a completed run.
   std::optional<std::string> candidate_from_closed_sources(
       const std::map<uint32_t, rvwmo::SourcePosition> &marks,
-      uint64_t completed_cycle, unsigned harts) const {
-    return enabled() && !failed_ ? certified_record(marks, completed_cycle, harts) : std::nullopt;
+      uint64_t completed_cycle, unsigned harts,
+      const std::map<uint32_t, rvwmo::SessionHartStatistics> *retirement_counts = nullptr) const {
+    return enabled() && !failed_ ? certified_record(marks, completed_cycle, harts,
+                                                      retirement_counts) : std::nullopt;
   }
 
   bool publish(const rvwmo::HostSession &session, rvwmo::CheckResult result,
@@ -97,7 +99,9 @@ public:
         (ordered_required_ && !session.ordered_semantic_observer_healthy()) || harts != 4)
       return false;
     try {
-      const auto report = candidate_from_closed_sources(session.semantic_source_watermarks(), completed_cycle, harts);
+      const auto report = candidate_from_closed_sources(
+          session.semantic_source_watermarks(), completed_cycle, harts,
+          &session.session()->hart_statistics());
       if (!report)
         return false;
       const auto temporary = path_ + ".tmp";
@@ -161,7 +165,8 @@ private:
 
   std::optional<std::string> certified_record(
       const std::map<uint32_t, rvwmo::SourcePosition> &marks,
-      uint64_t completed_cycle, unsigned harts) const {
+      uint64_t completed_cycle, unsigned harts,
+      const std::map<uint32_t, rvwmo::SessionHartStatistics> *retirement_counts) const {
     using namespace rvwmo;
     if (marks.size() != harts * 2 || certified_producers_.size() != marks.size() || events_.empty())
       return unavailable("missing_roster_or_events");
@@ -419,7 +424,47 @@ private:
       }
       output << '}';
     }
-    output << "]}\n";
+    output << ']';
+    if (retirement_counts) {
+      std::array<uint64_t, 4> per_hart{};
+      for (const auto &event : events_)
+        if (event.kind == RuntimeEventKind::InstructionRetire) {
+          const auto &instruction = std::get<InstructionRetireEvent>(event.payload).instruction;
+          if (instruction.hart >= harts || event.producer_id != hart_producer_id(instruction.hart) ||
+              event.source.cycle > completed_cycle || !event.source.producer_sequence)
+            return unavailable("retirement_roster_has_unqualified_source");
+          ++per_hart[instruction.hart];
+        }
+      for (uint32_t hart = 0; hart < harts; ++hart) {
+        const auto found = retirement_counts->find(hart);
+        const auto mark = marks.find(hart_producer_id(hart));
+        if (found == retirement_counts->end() || !per_hart[hart] ||
+            per_hart[hart] != found->second.retired_instructions ||
+            mark == marks.end() || mark->second.cycle < completed_cycle)
+          return unavailable("retirements_not_closed_or_do_not_match_checker");
+      }
+      std::array<uint64_t, 4> ordinals{};
+      output << ",\"retirement_trace_complete\":true,\"retirement_source_clock\":\"" << clock_
+             << "\",\"retirement_closed_through_cycle\":" << completed_cycle
+             << ",\"retirements\":[";
+      bool first_retirement = true;
+      for (const auto &event : events_)
+        if (event.kind == RuntimeEventKind::InstructionRetire) {
+          const auto &instruction = std::get<InstructionRetireEvent>(event.payload).instruction;
+          if (!first_retirement)
+            output << ',';
+          first_retirement = false;
+          output << "{\"hart\":" << instruction.hart << ",\"epoch\":" << instruction.epoch
+                 << ",\"uid\":" << instruction.uid << ",\"pc\":" << instruction.pc
+                 << ",\"instruction\":" << instruction.instruction
+                 << ",\"source_cycle\":" << event.source.cycle
+                 << ",\"producer_id\":" << event.producer_id
+                 << ",\"producer_sequence\":" << event.source.producer_sequence
+                 << ",\"program_order\":" << ordinals[instruction.hart]++ << '}';
+        }
+      output << ']';
+    }
+    output << "}\n";
     return output.str();
   }
 
