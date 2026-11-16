@@ -426,13 +426,16 @@ private:
     }
     output << ']';
     if (retirement_counts) {
+      bool retirement_complete = true;
       std::array<uint64_t, 4> per_hart{};
       for (const auto &event : events_)
         if (event.kind == RuntimeEventKind::InstructionRetire) {
           const auto &instruction = std::get<InstructionRetireEvent>(event.payload).instruction;
           if (instruction.hart >= harts || event.producer_id != hart_producer_id(instruction.hart) ||
-              event.source.cycle > completed_cycle || !event.source.producer_sequence)
-            return unavailable("retirement_roster_has_unqualified_source");
+              event.source.cycle > completed_cycle || !event.source.producer_sequence) {
+            retirement_complete = false;
+            continue;
+          }
           ++per_hart[instruction.hart];
         }
       for (uint32_t hart = 0; hart < harts; ++hart) {
@@ -441,10 +444,12 @@ private:
         if (found == retirement_counts->end() || !per_hart[hart] ||
             per_hart[hart] != found->second.retired_instructions ||
             mark == marks.end() || mark->second.cycle < completed_cycle)
-          return unavailable("retirements_not_closed_or_do_not_match_checker");
+          retirement_complete = false;
       }
+      output << ",\"retirement_trace_complete\":" << (retirement_complete ? "true" : "false");
+      if (retirement_complete) {
       std::array<uint64_t, 4> ordinals{};
-      output << ",\"retirement_trace_complete\":true,\"retirement_source_clock\":\"" << clock_
+      output << ",\"retirement_source_clock\":\"" << clock_
              << "\",\"retirement_closed_through_cycle\":" << completed_cycle
              << ",\"retirements\":[";
       bool first_retirement = true;
@@ -463,6 +468,7 @@ private:
                  << ",\"program_order\":" << ordinals[instruction.hart]++ << '}';
         }
       output << ']';
+      }
     }
     output << "}\n";
     return output.str();
