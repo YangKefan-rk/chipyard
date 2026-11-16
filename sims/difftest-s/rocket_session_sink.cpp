@@ -207,6 +207,11 @@ public:
       config.semantic_event_observer = [this](const rvwmo::RuntimeEvent &event) {
         semantic_feedback_.observe(event);
       };
+      semantic_feedback_.require_ordered_evidence();
+      config.ordered_semantic_event_observer = [this](const rvwmo::RuntimeEvent &event,
+                                                     const rvwmo::ObservationTime &time) {
+        semantic_feedback_.observe_ordered(event, time);
+      };
     }
     session_ = std::make_unique<rvwmo::HostSession>(memory_, std::move(config));
     if (!session_->configuration())

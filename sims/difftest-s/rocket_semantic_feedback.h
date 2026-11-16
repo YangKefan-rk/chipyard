@@ -63,6 +63,25 @@ public:
     }
   }
 
+  void require_ordered_evidence() { ordered_required_ = true; }
+
+  void observe_ordered(const rvwmo::RuntimeEvent &event,
+                       const rvwmo::ObservationTime &order) noexcept {
+    if (!enabled() || failed_ || (event.kind != rvwmo::RuntimeEventKind::LoadSample &&
+                                 event.kind != rvwmo::RuntimeEventKind::StorePublish))
+      return;
+    try {
+      if (!order.valid || !order.rank || ordered_.size() >= 100000 ||
+          !ordered_.emplace(std::make_pair(event.producer_id, event.source.producer_sequence), order).second) {
+        failed_ = true;
+        unavailable_reason_ = "missing_or_repeated_accepted_gmo";
+      }
+    } catch (...) {
+      failed_ = true;
+      unavailable_reason_ = "accepted_gmo_allocation";
+    }
+  }
+
   // A read-only candidate for isolated source-contract tests. It is not a
   // terminal Pass certificate; only publish() may expose a completed run.
   std::optional<std::string> candidate_from_closed_sources(
@@ -74,7 +93,8 @@ public:
   bool publish(const rvwmo::HostSession &session, rvwmo::CheckResult result,
                uint64_t completed_cycle, unsigned harts) noexcept {
     if (!enabled() || failed_ || result.status != rvwmo::CheckStatus::Pass ||
-        !session.semantic_feedback_publishable() || harts != 4)
+        !session.semantic_feedback_publishable() ||
+        (ordered_required_ && !session.ordered_semantic_observer_healthy()) || harts != 4)
       return false;
     try {
       const auto report = candidate_from_closed_sources(session.semantic_source_watermarks(), completed_cycle, harts);
@@ -148,7 +168,9 @@ private:
     for (const auto &[producer, position] : marks)
       if (!certified_producers_.count(producer))
         return unavailable("unqualified_source_capability");
+    struct RetirementOrigin { uint64_t pc, cycle; uint32_t instruction; };
     std::map<OperationId, MemoryOperation> retired;
+    std::map<OperationId, RetirementOrigin> origins;
     std::set<std::pair<OperationId, uint32_t>> canceled;
     std::set<OperationId> squashed;
     std::optional<uint64_t> epoch;
@@ -174,7 +196,9 @@ private:
           if (operation.id.hart != instruction.hart || operation.id.epoch != *epoch ||
               operation.id.uid != instruction.uid || squashed.count(operation.id) ||
               canceled.count({operation.id, operation.attempt}) ||
-              !retired.emplace(operation.id, operation).second)
+              !retired.emplace(operation.id, operation).second ||
+              !origins.emplace(operation.id, RetirementOrigin{
+                  instruction.pc, event.source.cycle, instruction.instruction}).second)
             return unavailable("retired_memory_identity");
         }
       }
@@ -326,6 +350,10 @@ private:
       const bool load = event.kind == RuntimeEventKind::LoadSample;
       const auto &publish = load ? StorePublishEvent{} : std::get<StorePublishEvent>(event.payload);
       const auto &op = load ? effect.operation : effect.members.front();
+      const auto source = std::make_pair(event.producer_id, event.source.producer_sequence);
+      const auto ranked = ordered_.find(source);
+      if (ordered_required_ && ranked == ordered_.end())
+        return unavailable("missing_accepted_gmo_for_final_effect");
       if (!first_event)
         output << ',';
       first_event = false;
@@ -337,9 +365,23 @@ private:
              << ",\"physical_address\":" << (load ? op.address : publish.address)
              << ",\"byte_mask\":" << *mask_bits(load ? op.byte_mask : publish.byte_mask)
              << ",\"address_is_physical\":true,\"final_attempt\":true";
-      if (load)
+      if (ranked != ordered_.end()) {
+        const auto &time = ranked->second;
+        output << ",\"gmo\":{\"rank\":" << time.rank
+               << ",\"unordered_read_group\":" << (time.unordered_read_group ? "true" : "false")
+               << ",\"unordered_effect_group\":" << (time.unordered_effect_group ? "true" : "false")
+               << ",\"isolated_store_group\":" << (time.isolated_store_group ? "true" : "false") << '}';
+      }
+      if (load) {
+        const auto origin = origins.find(op.id);
+        if (origin == origins.end())
+          return unavailable("retired_load_has_no_source_pc");
         output << ",\"retired\":true,\"uid\":" << op.id.uid
-               << ",\"attempt\":" << op.attempt << ",\"subaccess\":" << op.id.subaccess;
+               << ",\"attempt\":" << op.attempt << ",\"subaccess\":" << op.id.subaccess
+               << ",\"pc\":" << origin->second.pc
+               << ",\"instruction\":" << origin->second.instruction
+               << ",\"retirement_source_cycle\":" << origin->second.cycle;
+      }
       else {
         // This counter identifies a real cache write within its producer and
         // run. Rocket has no observed allocation generation for this group.
@@ -350,9 +392,28 @@ private:
           if (!first_member)
             output << ',';
           first_member = false;
+          const auto origin = origins.find(member.id);
+          if (origin == origins.end() || !mask_bits(member.byte_mask) ||
+              publish.byte_writers.size() != publish.byte_mask.size())
+            return unavailable("published_member_lacks_independent_pc_or_physical_bytes");
+          uint64_t visible_member_mask = 0;
+          for (size_t byte = 0; byte < publish.byte_mask.size(); ++byte) {
+            if (!publish.byte_mask[byte] || publish.byte_writers[byte] != member.id)
+              continue;
+            const uint64_t address = publish.address + byte;
+            if (address < member.address || address - member.address >= member.byte_mask.size() ||
+                !member.byte_mask[address - member.address])
+              return unavailable("published_member_writer_disagrees_with_retired_byte_provenance");
+            visible_member_mask |= UINT64_C(1) << (address - member.address);
+          }
           output << "{\"hart\":" << member.id.hart << ",\"uid\":" << member.id.uid
                  << ",\"attempt\":" << member.attempt << ",\"subaccess\":" << member.id.subaccess
-                 << ",\"retired\":true}";
+                 << ",\"retired\":true,\"pc\":" << origin->second.pc
+                 << ",\"instruction\":" << origin->second.instruction
+                 << ",\"retirement_source_cycle\":" << origin->second.cycle
+                 << ",\"physical_address\":" << member.address
+                 << ",\"byte_mask\":" << visible_member_mask
+                 << ",\"byte_provenance_verified\":true}";
         }
         output << ']';
       }
@@ -364,6 +425,8 @@ private:
 
   std::string path_;
   std::vector<rvwmo::RuntimeEvent> events_;
+  bool ordered_required_ = false;
+  std::map<std::pair<uint32_t, uint64_t>, rvwmo::ObservationTime> ordered_;
   std::set<uint32_t> certified_producers_;
   bool failed_ = false;
   mutable const char *unavailable_reason_ = "none";
