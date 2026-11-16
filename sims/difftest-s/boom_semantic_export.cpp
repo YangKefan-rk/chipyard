@@ -272,7 +272,8 @@ void BoomSemanticExport::publish(const rvwmo::HostSession &session) {
     output << json_string(roster[index].name)
            << ":{\"epoch\":1,\"source_clock\":" << json_string(kClock)
            << ",\"complete\":true,\"lossless\":true,\"closed_through_cycle\":"
-           << watermarks.at(roster[index].id).cycle << '}';
+           << watermarks.at(roster[index].id).cycle
+           << ",\"event_sequence\":" << watermarks.at(roster[index].id).producer_sequence << '}';
   }
   output << "},\"events\":[";
   bool first = true;
