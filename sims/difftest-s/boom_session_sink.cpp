@@ -1,6 +1,9 @@
 #include "boom_native_source.h"
 #include "boom_hartbreaker_elf.h"
 #include "boom_semantic_export.h"
+#if DIFFTEST_S_BOOM_TESTCHIPIP_BOOT_ENTRY
+#include "boom_testchipip_boot_entry.h"
+#endif
 #include "rvwmo/host_session.h"
 #include "rvwmo/dependency.h"
 #include "rvwmo/memory_image.h"
@@ -48,6 +51,9 @@ public:
     auto loaded = rvwmo::load_reference_elf(memory_, elf, entry);
     if (!loaded)
       throw std::invalid_argument("independent reference ELF: " + loaded.message);
+#if DIFFTEST_S_BOOM_TESTCHIPIP_BOOT_ENTRY
+    validate_boom_testchipip_boot_entry(entry, layout->harts);
+#endif
 
     const char *mode = std::getenv("DIFFTEST_S_BOOM_TERMINAL_MODE");
     if (mode && *mode) {
@@ -123,6 +129,9 @@ public:
     config.verification_scope = tohost_address_
         ? "initialized DRAM-entry scalar RAM; own-hart CLINT device stores skipped without value or I/O-order verification; boot ROM uncovered"
         : "initialized DRAM-entry scalar RAM; boot ROM, bootstrap CSR/MMIO/traps are uncovered";
+#if DIFFTEST_S_BOOM_TESTCHIPIP_BOOT_ENTRY
+    config.verification_scope += "; independent fixed TestChipIP quad-hart ELF-entry CSR initialization";
+#endif
     config.verification_scope += "; mcycle pure-read values are source-sampled environment inputs, counter generation is not independently checked";
     // The physical exception certificate covers trap routing and scalar CSR
     // poststate, not a complete architectural register-file readback.
@@ -149,6 +158,9 @@ public:
       // This explicit test profile requires an entry program whose only GPR
       // read before initialization is a0, set by the native ROM's mhartid read.
       initial.gpr[10] = hart;
+#if DIFFTEST_S_BOOM_TESTCHIPIP_BOOT_ENTRY
+      initialize_boom_testchipip_boot_csrs(initial);
+#endif
       initialized_registers_[hart][0] = true;
       initialized_registers_[hart][10] = true;
       const auto producer = rvwmo::hart_producer_id(hart);

@@ -148,6 +148,16 @@ remain outside this checked prefix. Optional `DIFFTEST_S_RAM_BASE` and
 `DIFFTEST_S_RAM_SIZE` configure reference RAM (decimal or 0x notation, at most
 4 GiB).
 
+The `DIFFTEST_S_BOOM_TESTCHIPIP_BOOT_ENTRY=1` compile-time option is for the
+verified four-hart TestChipIP RV64 boot image and BootAddrReg default
+`0x80000000` only. Before enabling it, the build must pin the generated Boot
+ROM and BootAddrReg RTL that is actually linked. The host rejects a different
+hart count or ELF entry. It initializes Spike's deterministic CSR state after
+the software-interrupt wakeup and `mret` from that fixed boot path. It does
+not synthesize DUT CSR results, compare the ROM's own execution, or change
+which retired instructions receive CSR checks. Builds without the define
+retain the original entry setup.
+
 BOOM requires these host settings from the selected ELF and its independent
 expected success word:
 
