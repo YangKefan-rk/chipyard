@@ -6,6 +6,7 @@ presets, with native observations and a synchronous simulation clock:
 | Configuration | Core preset | Harts |
 | --- | --- | --- |
 | `QuadSmallBoomV4DifftestSConfig` | `boom.v4.common.WithNSmallBooms(4)` | 4 |
+| `QuadSmallBoomV4Ldq16Mshr8DifftestSConfig` | Small BOOM V4 with 16 load queue entries and 8 MSHRs | 4 |
 | `QuadRocketDifftestSConfig` | `freechips.rocketchip.rocket.WithNBigCores(4)` | 4 |
 | `QuadRocketMergeDifftestSConfig` | Big Rocket, parity ECC with two-byte granules | 4 |
 
@@ -27,7 +28,20 @@ git submodule update --init --recursive generators/boom generators/rocket-chip
 ```
 
 Difftest-S and its reference Spike are separate checkouts, selected through
-explicit build paths. The recorded BOOM four-hart acceptance cohort uses:
+explicit build paths. For the November 2026 integration, the BOOM gitlink
+is `45697d6bc6a19058edbf34302c64dfa7a78ef833`; Rocket is
+`8096f868aaf3e88621d132dae36ee3810059b566`. Use
+[Difftest-S](https://github.com/YangKefan-rk/difftest-s) at
+`002135c4121b5d063c797bcf9522a0c24f1fdc01` and
+[Spike](https://github.com/YangKefan-rk/Spike) at
+`fce03d82f076f7e6eb1384ebbd27cd112357088f` for the build below.
+Use `QuadSmallBoomV4Ldq16Mshr8DifftestSConfig` specifically when matching
+the LDQ16/MSHR8 configuration; the baseline example is a different model.
+These source pins do not certify any new simulator.
+
+### Historical cohorts
+
+The earlier BOOM four-hart acceptance cohort used:
 
 | Component | Revision |
 | --- | --- |
@@ -37,9 +51,9 @@ explicit build paths. The recorded BOOM four-hart acceptance cohort uses:
 | `YangKefan-rk/Spike` | `752638c4034e385fd910a9ea1e0e0d179ffbeea2` |
 
 Select these exact external revisions when reproducing that **historical BOOM**
-cohort. They are not the current Rocket/HartBreaker source set. For Rocket,
-this Chipyard revision pins Rocket `6cff31948e719aa9e2d67c4dbdb850a3e4a91978`;
-use Difftest-S `9a218abaf838` and reference Spike `45e1c427bf0e` from
+cohort. For the separate historical Rocket/HartBreaker cohort, the recorded
+Rocket pin was `6cff31948e719aa9e2d67c4dbdb850a3e4a91978` with
+Difftest-S `9a218abaf838` and reference Spike `45e1c427bf0e` from
 `YangKefan-rk` as separate checkouts. Generate quadrocket ELF inputs using
 `YangKefan-rk/hartbreaker` at `45a34d7040821decfe23d9d54c2710b47693ea31`
 (which includes the shared-address-register fix `4dd941acd674`). The fork provides `simulators/quadrocket/cfg.json` and
@@ -101,7 +115,7 @@ make -f ../difftest-s/Makefile CONFIG=QuadRocketDifftestSConfig \
   DIFFTEST_S_SPIKE_LIBRARY=/absolute/path/to/build/rocket-ref/riscv64-spike-ref-api.so
 ```
 
-Both checkouts must contain the revisions listed above. At run time, set
+Use the external revisions for the selected cohort. At run time, set
 `DIFFTEST_S_ELF` to the same ELF supplied to the native simulator and choose
 exactly one Rocket terminal mode below. A compiled binary or a ROM-only run is
 not an acceptance result.
@@ -110,7 +124,8 @@ To exercise merged pending stores, use `CONFIG=QuadRocketMergeDifftestSConfig`
 with the same Rocket reference profile. The default Rocket configuration uses
 one-byte ECC granules and does not merge pending stores. The merge profile
 changes only the DCache ECC settings; it retains four Big Rocket cores and the
-same observation and terminal contracts. Its compatible source revisions are:
+same observation and terminal contracts. The following pins belong to the
+historical merge-support run; do not substitute them in the current build:
 
 | Component | Merge-support revision |
 | --- | --- |

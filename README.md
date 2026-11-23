@@ -23,6 +23,7 @@ Chipyard is actively developed in the [Berkeley Architecture Research Group][ucb
 
 ## Resources
 
+* [Four-hart Rocket and BOOM Verilator builds with Difftest-S](sims/difftest-s/README.md)
 * Chipyard Documentation: https://chipyard.readthedocs.io/
 * Chipyard (x FireSim) Tutorial: https://fires.im/tutorial-recent/
 * Chipyard Basics slides: https://fires.im/asplos23-slides-pdf/02_chipyard_basics.pdf
