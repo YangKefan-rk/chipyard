@@ -29,12 +29,12 @@ git submodule update --init --recursive generators/boom generators/rocket-chip
 
 Difftest-S and its reference Spike are separate checkouts, selected through
 explicit build paths. For the November 2026 integration, the BOOM gitlink
-is `45697d6bc6a19058edbf34302c64dfa7a78ef833`; Rocket is
+is `79897ea8b0e249b27260b639d464f197ce4c5625`; Rocket is
 `8096f868aaf3e88621d132dae36ee3810059b566`. Use
 [Difftest-S](https://github.com/YangKefan-rk/difftest-s) at
-`002135c4121b5d063c797bcf9522a0c24f1fdc01` and
+`60ab83f7797620e51415b1836c5678475399e6aa` and
 [Spike](https://github.com/YangKefan-rk/Spike) at
-`fce03d82f076f7e6eb1384ebbd27cd112357088f` for the build below.
+`c1076471c602a49bf4c11caab15ee64fe4a0e753` for the build below.
 Use `QuadSmallBoomV4Ldq16Mshr8DifftestSConfig` specifically when matching
 the LDQ16/MSHR8 configuration; the baseline example is a different model.
 These source pins do not certify any new simulator.
@@ -189,6 +189,9 @@ cache/coherence clocks continue until the observed sources drain. Marker
 retirement, architectural comparison and physical drain are separate checks.
 PCs and expected values must be derived for each ELF rather than copied from
 another program.
+
+The [BOOM SFENCE.VMA regression](tests/boom-sfence/README.md) covers Bare
+and Sv39 with an ordinary store updating a shared leaf PTE at runtime.
 
 Rocket has **two mutually exclusive terminal modes**, both requiring
 `DIFFTEST_S_START_AT_ELF=1` and `DIFFTEST_S_ELF` to name the tested ELF:

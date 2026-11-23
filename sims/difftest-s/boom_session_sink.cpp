@@ -136,6 +136,8 @@ public:
     config.verification_scope += "; synchronous trap UID/PC/cause/redirect/privilege/active-bank CSR/tval checked; inactive-bank CSR prestate and full DUT GPR/FPR trap poststate unobserved";
     config.skip_device_stores = tohost_address_ != 0;
     config.reference_profile = DIFFTEST_REF_PROFILE_ID_BOOM;
+    // Spike's implicit PTE reads use the shared physical image directly.
+    config.audit_before_publication = true;
     config.check_boom_traps = true;
     config.initial_harts.resize(layout->harts);
     initialized_registers_.resize(layout->harts);

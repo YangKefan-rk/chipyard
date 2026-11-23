@@ -192,6 +192,8 @@ CheckResult BoomNativeSource::capture_hart(boom::NativeFrame frame,
     frame.counter_read.reset();
   frame.fp_posts.erase(std::remove_if(frame.fp_posts.begin(), frame.fp_posts.end(),
       [&](const auto &post) { return post.identity.uid < entry_uids_[hart]; }), frame.fp_posts.end());
+  frame.system_states.erase(std::remove_if(frame.system_states.begin(), frame.system_states.end(),
+      [&](const auto &sample) { return sample.identity.uid < entry_uids_[hart]; }), frame.system_states.end());
   if (configuration_.terminal_pc) {
     const auto &facts = terminal_facts_[hart];
     if (!facts.armed || facts.configured_pc != configuration_.terminal_pc)

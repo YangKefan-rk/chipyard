@@ -235,6 +235,25 @@ struct FpPostFields : RecordFields {
     return {identity.read(sample), cycle.read(sample), pc.read(sample), fcsr.read(sample), mstatus.read(sample)};
   }
 };
+struct SystemStateFields {
+  NativeField satp, privilege, mstatus;
+  SystemStateFields(const NativeFields &fields, const std::string &path)
+      : satp(fields.field(path + ".satp")), privilege(fields.field(path + ".privilege")),
+        mstatus(fields.field(path + ".mstatus")) {}
+  rvwmo::SystemState read(const Sample &sample) const {
+    return {satp.read(sample), privilege.read(sample), mstatus.read(sample)};
+  }
+};
+struct SfenceStateFields : RecordFields {
+  NativeField pc;
+  SystemStateFields before, after;
+  SfenceStateFields(const NativeFields &fields, const std::string &path)
+      : RecordFields(fields, path), pc(fields.field(path + ".bits.pc")),
+        before(fields, path + ".bits.before"), after(fields, path + ".bits.after") {}
+  boom::NativeSystemRetirementState read(const Sample &sample) const {
+    return {identity.read(sample), cycle.read(sample), pc.read(sample), {before.read(sample), after.read(sample)}};
+  }
+};
 struct WfiParkFields {
   NativeField valid, cycle, csr_wait, rob_only_entry, interrupt_pending, writeback_active;
   NativeField marker_pc, marker_instruction, marker_architectural;
@@ -326,6 +345,7 @@ struct BoomNativeDecoder::Fields {
   std::optional<CsrPostFields> csr_write_post;
   std::optional<CsrPostFields> counter_read;
   std::vector<FpPostFields> fp_post;
+  std::vector<SfenceStateFields> sfence_state;
   std::vector<DeviceStoreFields> mmio_requests, mmio_acks;
 
   Fields(const NativeProbeLayout &source, BoomPublicationSource publications)
@@ -368,6 +388,8 @@ struct BoomNativeDecoder::Fields {
       counter_read.emplace(metadata, "core.counter_read");
     if (metadata.has_field("core.fp_post[0].valid"))
       fp_post = vector_fields<FpPostFields>(metadata, "core.fp_post");
+    if (metadata.has_field("core.sfence_state[0].valid"))
+      sfence_state = vector_fields<SfenceStateFields>(metadata, "core.sfence_state");
     const bool requests = metadata.has_field("cache.mmio_request[0].valid");
     const bool acknowledgments = metadata.has_field("cache.mmio_ack[0].valid");
     if (requests != acknowledgments)
@@ -412,6 +434,10 @@ struct BoomNativeDecoder::Fields {
     }
     frame.csr_write_probe_available = csr_write_post.has_value();
     frame.fp_probe_available = !fp_post.empty();
+    frame.system_state_probe_available = !sfence_state.empty();
+    for (const auto &field : sfence_state)
+      if (field.valid.read(sample))
+        frame.system_states.push_back(field.read(sample));
     for (const auto &field : fp_post) {
       if (!field.valid.read(sample))
         continue;
