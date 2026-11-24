@@ -34,7 +34,7 @@ is `79897ea8b0e249b27260b639d464f197ce4c5625`; Rocket is
 [Difftest-S](https://github.com/YangKefan-rk/difftest-s) at
 `60ab83f7797620e51415b1836c5678475399e6aa` and
 [Spike](https://github.com/YangKefan-rk/Spike) at
-`c1076471c602a49bf4c11caab15ee64fe4a0e753` for the build below.
+`ec6743a82ec93bad05fdc44af69060292d553b17` for the build below.
 Use `QuadSmallBoomV4Ldq16Mshr8DifftestSConfig` specifically when matching
 the LDQ16/MSHR8 configuration; the baseline example is a different model.
 These source pins do not certify any new simulator.
